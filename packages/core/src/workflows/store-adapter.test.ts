@@ -1,10 +1,11 @@
 import { describe, test, expect, mock, beforeEach } from 'bun:test';
-import type { IWorkflowStore } from '@archon/workflows';
+import type { IWorkflowStore } from '@archon/workflows/store';
 
 // Mock DB modules before importing store-adapter
 const mockCreateWorkflowRun = mock(() => Promise.resolve({ id: 'run-1' }));
 const mockGetWorkflowRun = mock(() => Promise.resolve(null));
-const mockGetActiveWorkflowRun = mock(() => Promise.resolve(null));
+const mockGetActiveWorkflowRunByPath = mock(() => Promise.resolve(null));
+const mockFailOrphanedRuns = mock(() => Promise.resolve({ count: 0 }));
 const mockFindResumableRun = mock(() => Promise.resolve(null));
 const mockResumeWorkflowRun = mock(() => Promise.resolve({ id: 'run-1' }));
 const mockUpdateWorkflowRun = mock(() => Promise.resolve());
@@ -12,11 +13,14 @@ const mockUpdateWorkflowActivity = mock(() => Promise.resolve());
 const mockGetWorkflowRunStatus = mock(() => Promise.resolve('running'));
 const mockCompleteWorkflowRun = mock(() => Promise.resolve());
 const mockFailWorkflowRun = mock(() => Promise.resolve());
+const mockCancelWorkflowRun = mock(() => Promise.resolve());
+const mockPauseWorkflowRun = mock(() => Promise.resolve());
 
 mock.module('../db/workflows', () => ({
   createWorkflowRun: mockCreateWorkflowRun,
   getWorkflowRun: mockGetWorkflowRun,
-  getActiveWorkflowRun: mockGetActiveWorkflowRun,
+  getActiveWorkflowRunByPath: mockGetActiveWorkflowRunByPath,
+  failOrphanedRuns: mockFailOrphanedRuns,
   findResumableRun: mockFindResumableRun,
   resumeWorkflowRun: mockResumeWorkflowRun,
   updateWorkflowRun: mockUpdateWorkflowRun,
@@ -24,11 +28,15 @@ mock.module('../db/workflows', () => ({
   getWorkflowRunStatus: mockGetWorkflowRunStatus,
   completeWorkflowRun: mockCompleteWorkflowRun,
   failWorkflowRun: mockFailWorkflowRun,
+  cancelWorkflowRun: mockCancelWorkflowRun,
+  pauseWorkflowRun: mockPauseWorkflowRun,
 }));
 
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
+const mockGetCompletedDagNodeOutputs = mock(() => Promise.resolve(new Map<string, string>()));
 mock.module('../db/workflow-events', () => ({
   createWorkflowEvent: mockCreateWorkflowEvent,
+  getCompletedDagNodeOutputs: mockGetCompletedDagNodeOutputs,
 }));
 
 const mockGetCodebase = mock(() => Promise.resolve(null));
@@ -52,7 +60,8 @@ describe('createWorkflowStore', () => {
     const requiredMethods: (keyof IWorkflowStore)[] = [
       'createWorkflowRun',
       'getWorkflowRun',
-      'getActiveWorkflowRun',
+      'getActiveWorkflowRunByPath',
+      'failOrphanedRuns',
       'findResumableRun',
       'resumeWorkflowRun',
       'updateWorkflowRun',
@@ -60,8 +69,12 @@ describe('createWorkflowStore', () => {
       'getWorkflowRunStatus',
       'completeWorkflowRun',
       'failWorkflowRun',
+      'pauseWorkflowRun',
+      'cancelWorkflowRun',
       'createWorkflowEvent',
+      'getCompletedDagNodeOutputs',
       'getCodebase',
+      'getCodebaseEnvVars',
     ];
     for (const method of requiredMethods) {
       expect(typeof store[method]).toBe('function');
@@ -95,6 +108,22 @@ describe('createWorkflowStore', () => {
         step_name: 'test-step',
       })
     ).resolves.toBeUndefined();
+  });
+
+  test('delegates getCompletedDagNodeOutputs to DB', async () => {
+    const expected = new Map([['step1', 'output text']]);
+    mockGetCompletedDagNodeOutputs.mockResolvedValueOnce(expected);
+    const store = createWorkflowStore();
+    const result = await store.getCompletedDagNodeOutputs('run-123');
+    expect(result).toBe(expected);
+    expect(mockGetCompletedDagNodeOutputs).toHaveBeenCalledWith('run-123');
+  });
+
+  test('delegates cancelWorkflowRun to DB', async () => {
+    mockCancelWorkflowRun.mockResolvedValueOnce(undefined);
+    const store = createWorkflowStore();
+    await store.cancelWorkflowRun('run-123');
+    expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-123');
   });
 
   test('delegates getCodebase to DB', async () => {

@@ -17,6 +17,7 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
 }));
 
 import { ClaudeClient } from './claude';
+import * as claudeModule from './claude';
 
 describe('ClaudeClient', () => {
   let client: ClaudeClient;
@@ -32,7 +33,7 @@ describe('ClaudeClient', () => {
 
   describe('constructor', () => {
     test('throws when running as root (UID 0)', () => {
-      const spy = spyOn(process, 'getuid').mockReturnValue(0);
+      const spy = spyOn(claudeModule, 'getProcessUid').mockReturnValue(0);
       expect(() => new ClaudeClient()).toThrow(
         'does not support bypassPermissions when running as root'
       );
@@ -40,7 +41,13 @@ describe('ClaudeClient', () => {
     });
 
     test('does not throw for non-root user', () => {
-      const spy = spyOn(process, 'getuid').mockReturnValue(1000);
+      const spy = spyOn(claudeModule, 'getProcessUid').mockReturnValue(1000);
+      expect(() => new ClaudeClient()).not.toThrow();
+      spy.mockRestore();
+    });
+
+    test('does not throw when process.getuid is unavailable (Windows)', () => {
+      const spy = spyOn(claudeModule, 'getProcessUid').mockReturnValue(undefined);
       expect(() => new ClaudeClient()).not.toThrow();
       spy.mockRestore();
     });
@@ -453,6 +460,45 @@ describe('ClaudeClient', () => {
       expect(mockQuery).toHaveBeenCalledTimes(1);
     });
 
+    test('classifies "Operation aborted" errors as crash and retries', async () => {
+      // Simulates the SDK cleanup race: PostToolUse hook writes to a closed pipe
+      // after a DAG node abort. Should be classified as 'crash' (not 'unknown')
+      // so the retry path is taken.
+      const error = new Error('Operation aborted');
+      mockQuery.mockImplementation(async function* () {
+        throw error;
+      });
+
+      const consumeGenerator = async (): Promise<void> => {
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        for await (const _ of client.sendQuery('test', '/workspace')) {
+          // consume
+        }
+      };
+
+      // crash classification = retried up to 3 times → 4 total calls
+      await expect(consumeGenerator()).rejects.toThrow(/Claude Code crash/);
+      expect(mockQuery).toHaveBeenCalledTimes(4);
+    }, 30_000);
+
+    test('classifies mixed-case "OPERATION ABORTED" errors as crash', async () => {
+      // Pattern matching uses .toLowerCase() — case must not matter
+      const error = new Error('OPERATION ABORTED');
+      mockQuery.mockImplementation(async function* () {
+        throw error;
+      });
+
+      const consumeGenerator = async (): Promise<void> => {
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        for await (const _ of client.sendQuery('test', '/workspace')) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(/Claude Code crash/);
+      expect(mockQuery).toHaveBeenCalledTimes(4);
+    }, 30_000);
+
     test('captures all stderr output for diagnostics', async () => {
       // When the subprocess crashes, the enriched error should include all stderr,
       // not just lines matching error keywords
@@ -482,6 +528,77 @@ describe('ClaudeClient', () => {
       expect(err.message).toContain('AJV validation');
       expect(err.message).toContain('startup diagnostic');
     }, 30_000);
+
+    test('passes settingSources from request options', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'test-session' };
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+        settingSources: ['project', 'user'],
+      })) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      expect(callArgs.options.settingSources).toEqual(['project', 'user']);
+    });
+
+    test('defaults settingSources to project when not provided', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'test-session' };
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      for await (const _ of client.sendQuery('test', '/tmp')) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      expect(callArgs.options.settingSources).toEqual(['project']);
+    });
+
+    test('passes env from requestOptions into SDK options', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+        env: { MY_SECRET: 'abc123' },
+      })) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      const env = callArgs.options.env as Record<string, string>;
+      expect(env.MY_SECRET).toBe('abc123');
+      // Verify process.env entries are still present (not fully replaced)
+      expect(env.PATH).toBeDefined();
+    });
+
+    test('requestOptions.env overrides buildSubprocessEnv values', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+
+      // HOME is always in process.env — override it to verify priority
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+        env: { HOME: '/custom/home' },
+      })) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      const env = callArgs.options.env as Record<string, string>;
+      expect(env.HOME).toBe('/custom/home');
+    });
 
     test('ignores empty text blocks', async () => {
       mockQuery.mockImplementation(async function* () {

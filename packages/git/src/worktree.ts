@@ -1,12 +1,12 @@
 import { readFile, access } from 'fs/promises';
-import { join, dirname } from 'path';
+import { join } from 'path';
 import {
   createLogger,
   getArchonWorktreesPath,
   getArchonWorkspacesPath,
   getProjectWorktreesPath,
 } from '@archon/paths';
-import { execFileAsync, mkdirAsync } from './exec';
+import { execFileAsync } from './exec';
 import type { RepoPath, BranchName, WorktreePath, WorktreeInfo } from './types';
 import { toRepoPath, toBranchName, toWorktreePath } from './types';
 
@@ -20,23 +20,34 @@ function getLog(): ReturnType<typeof createLogger> {
 /**
  * Get the base directory for worktrees.
  *
- * For paths under ~/.archon/workspaces/owner/repo/..., returns the project-scoped
- * worktrees path: ~/.archon/workspaces/owner/repo/worktrees/
- *
- * For paths outside the workspaces directory, returns the legacy global path:
- * ~/.archon/worktrees/
+ * Resolution order:
+ * 1. If `codebaseName` is provided in "owner/repo" format, returns the project-scoped
+ *    path directly: ~/.archon/workspaces/owner/repo/worktrees/
+ * 2. For paths under ~/.archon/workspaces/owner/repo/..., extracts owner/repo from path
+ *    and returns the project-scoped path.
+ * 3. Otherwise, returns the legacy global path: ~/.archon/worktrees/
  */
-export function getWorktreeBase(repoPath: RepoPath): string {
+export function getWorktreeBase(repoPath: RepoPath, codebaseName?: string): string {
+  // If codebase name is known, use project-scoped path directly
+  if (codebaseName) {
+    const parts = codebaseName.split('/');
+    if (parts.length === 2 && parts[0] && parts[1]) {
+      return getProjectWorktreesPath(parts[0], parts[1]);
+    }
+    // codebaseName present but not "owner/repo" format — fall through to path detection.
+    // This is intentional: safe degradation to legacy global path.
+    getLog().warn({ codebaseName }, 'worktree.invalid_codebase_name_format');
+  }
+  // Existing path-prefix detection (cloned repos under workspaces/)
   const workspacesPath = getArchonWorkspacesPath();
   if (repoPath.startsWith(workspacesPath)) {
-    // Extract owner/repo from the path
     const relative = repoPath.substring(workspacesPath.length + 1);
     const parts = relative.split(/[/\\]/).filter(p => p.length > 0);
     if (parts.length >= 2) {
       return getProjectWorktreesPath(parts[0], parts[1]);
     }
   }
-  // Legacy fallback
+  // Legacy global fallback (no codebase name, no workspace path match)
   return getArchonWorktreesPath();
 }
 
@@ -46,8 +57,16 @@ export function getWorktreeBase(repoPath: RepoPath): string {
  *
  * When project-scoped, the worktree base already includes the owner/repo context,
  * so callers should NOT append owner/repo again.
+ *
+ * Resolution order mirrors `getWorktreeBase`: codebaseName → path detection → legacy.
  */
-export function isProjectScopedWorktreeBase(repoPath: RepoPath): boolean {
+export function isProjectScopedWorktreeBase(repoPath: RepoPath, codebaseName?: string): boolean {
+  // If codebase name is known, it's always project-scoped
+  if (codebaseName) {
+    const parts = codebaseName.split('/');
+    if (parts.length === 2 && parts[0] && parts[1]) return true;
+    // Invalid format — fall through to path detection (same safe degradation as getWorktreeBase).
+  }
   const workspacesPath = getArchonWorkspacesPath();
   if (!repoPath.startsWith(workspacesPath)) return false;
   const relative = repoPath.substring(workspacesPath.length + 1);
@@ -64,18 +83,31 @@ export function isProjectScopedWorktreeBase(repoPath: RepoPath): boolean {
  * Throws for unexpected errors (permission denied, I/O errors, etc.)
  */
 export async function worktreeExists(worktreePath: WorktreePath): Promise<boolean> {
+  // Step 1: Check if directory exists
   try {
     await access(worktreePath);
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === 'ENOENT') {
+      return false;
+    }
+    getLog().error({ worktreePath, err, code: err.code }, 'worktree.existence_check_failed');
+    throw new Error(`Failed to check worktree at ${worktreePath}: ${err.message}`);
+  }
+
+  // Step 2: Check if .git entry exists (directory exists at this point)
+  try {
     const gitPath = join(worktreePath, '.git');
     await access(gitPath);
     return true;
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
     if (err.code === 'ENOENT') {
+      // Directory exists but .git is missing — corruption signal
+      getLog().warn({ worktreePath }, 'worktree.corruption_detected');
       return false;
     }
-    // Unexpected error - permission denied, I/O error, etc.
-    getLog().error({ worktreePath, err, code: err.code }, 'worktree_existence_check_failed');
+    getLog().error({ worktreePath, err, code: err.code }, 'worktree.existence_check_failed');
     throw new Error(`Failed to check worktree at ${worktreePath}: ${err.message}`);
   }
 }
@@ -114,16 +146,19 @@ export async function listWorktrees(repoPath: RepoPath): Promise<WorktreeInfo[]>
     const err = error as Error & { code?: string; stderr?: string };
     const errorText = `${err.message} ${err.stderr ?? ''}`;
 
+    // ENOENT on repo path itself — distinct from "not a git repository"
+    if (errorText.includes('No such file or directory')) {
+      getLog().warn({ repoPath }, 'worktree.list_repo_missing');
+      return [];
+    }
+
     // Expected: not a git repository - return empty list
-    if (
-      errorText.includes('not a git repository') ||
-      errorText.includes('No such file or directory')
-    ) {
+    if (errorText.includes('not a git repository')) {
       return [];
     }
 
     // Unexpected error - log and throw
-    getLog().error({ repoPath, err, code: err.code, stderr: err.stderr }, 'list_worktrees_failed');
+    getLog().error({ repoPath, err, code: err.code, stderr: err.stderr }, 'worktree.list_failed');
     throw new Error(`Failed to list worktrees for ${repoPath}: ${err.message}`);
   }
 }
@@ -233,140 +268,4 @@ export function extractOwnerRepo(repoPath: RepoPath): { owner: string; repo: str
     );
   }
   return { owner: parts[parts.length - 2], repo: parts[parts.length - 1] };
-}
-
-/**
- * Create a git worktree for an issue or PR.
- * Returns the worktree path.
- *
- * For PRs: provide prHeadBranch and optionally prHeadSha for reproducible reviews.
- * For PRs without prHeadBranch: falls back to creating a new branch (pr-XX),
- * same as the issue path.
- * For issues: creates a new branch (issue-XX).
- *
- * Will adopt existing worktrees if found (enables skill-app symbiosis).
- */
-export async function createWorktreeForIssue(
-  repoPath: RepoPath,
-  issueNumber: number,
-  isPR: boolean,
-  prHeadBranch?: BranchName,
-  prHeadSha?: string
-): Promise<WorktreePath> {
-  const branchName = isPR ? `pr-${String(issueNumber)}` : `issue-${String(issueNumber)}`;
-
-  const worktreeBase = getWorktreeBase(repoPath);
-  let worktreePath: WorktreePath;
-
-  if (isProjectScopedWorktreeBase(repoPath)) {
-    // Project-scoped: worktreeBase already includes owner/repo context
-    worktreePath = toWorktreePath(join(worktreeBase, branchName));
-  } else {
-    // Legacy global: extract owner/repo from the last two path segments to avoid collisions
-    const { owner: ownerName, repo: repoName } = extractOwnerRepo(repoPath);
-    worktreePath = toWorktreePath(join(worktreeBase, ownerName, repoName, branchName));
-  }
-
-  // Check if worktree already exists at expected path (possibly created by skill)
-  if (await worktreeExists(worktreePath)) {
-    getLog().info({ worktreePath }, 'worktree_adopted');
-    return worktreePath;
-  }
-
-  // For PRs: also check if skill created a worktree with the PR's branch name
-  if (isPR && prHeadBranch) {
-    const existingByBranch = await findWorktreeByBranch(repoPath, prHeadBranch);
-    if (existingByBranch) {
-      getLog().info({ prHeadBranch, worktreePath: existingByBranch }, 'worktree_adopted_by_branch');
-      return existingByBranch;
-    }
-  }
-
-  // Ensure worktree parent directory exists
-  await mkdirAsync(dirname(worktreePath), { recursive: true });
-
-  if (isPR && prHeadBranch) {
-    // For PRs: fetch and checkout the PR's head branch
-    try {
-      // If SHA provided, use it for reproducible reviews (hybrid approach)
-      if (prHeadSha) {
-        // Fetch the specific commit SHA using PR refs (works for both fork and non-fork PRs)
-        // GitHub creates refs/pull/<number>/head for all PRs automatically
-        await execFileAsync(
-          'git',
-          ['-C', repoPath, 'fetch', 'origin', `pull/${String(issueNumber)}/head`],
-          {
-            timeout: 30000,
-          }
-        );
-
-        // Create worktree at the specific SHA
-        await execFileAsync('git', ['-C', repoPath, 'worktree', 'add', worktreePath, prHeadSha], {
-          timeout: 30000,
-        });
-
-        // Create a local tracking branch so it's not detached HEAD
-        await execFileAsync(
-          'git',
-          ['-C', worktreePath, 'checkout', '-b', `pr-${String(issueNumber)}-review`, prHeadSha],
-          {
-            timeout: 30000,
-          }
-        );
-      } else {
-        // Use GitHub's PR refs which work for both fork and non-fork PRs
-        // GitHub automatically creates refs/pull/<number>/head for all PRs
-        await execFileAsync(
-          'git',
-          [
-            '-C',
-            repoPath,
-            'fetch',
-            'origin',
-            `pull/${String(issueNumber)}/head:pr-${String(issueNumber)}-review`,
-          ],
-          {
-            timeout: 30000,
-          }
-        );
-
-        // Create worktree using the fetched PR ref
-        await execFileAsync(
-          'git',
-          ['-C', repoPath, 'worktree', 'add', worktreePath, `pr-${String(issueNumber)}-review`],
-          {
-            timeout: 30000,
-          }
-        );
-      }
-    } catch (error) {
-      const err = error as Error & { stderr?: string };
-      const detail = err.stderr?.trim() || err.message;
-      throw new Error(`Failed to create worktree for PR #${String(issueNumber)}: ${detail}`);
-    }
-  } else {
-    // For issues (or PRs without branch info): create new branch
-    try {
-      // Try to create with new branch
-      await execFileAsync(
-        'git',
-        ['-C', repoPath, 'worktree', 'add', worktreePath, '-b', branchName],
-        {
-          timeout: 30000,
-        }
-      );
-    } catch (error) {
-      const err = error as Error & { stderr?: string };
-      // Branch already exists - use existing branch
-      if (err.stderr?.includes('already exists')) {
-        await execFileAsync('git', ['-C', repoPath, 'worktree', 'add', worktreePath, branchName], {
-          timeout: 30000,
-        });
-      } else {
-        throw error;
-      }
-    }
-  }
-
-  return worktreePath;
 }

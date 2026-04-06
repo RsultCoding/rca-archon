@@ -104,7 +104,6 @@ describe('IsolationResolver', () => {
     return new IsolationResolver({
       store: makeMockStore(),
       provider: makeMockProvider(),
-      maxWorktreesPerCodebase: 25,
       staleThresholdDays: 14,
       ...overrides,
     });
@@ -319,80 +318,6 @@ describe('IsolationResolver', () => {
     );
   });
 
-  test('limit reached, cleanup succeeds — returns created with autoCleanedCount', async () => {
-    let countCalls = 0;
-    const resolver = createResolver({
-      store: makeMockStore({
-        countActiveByCodebase: async () => {
-          countCalls++;
-          return countCalls === 1 ? 25 : 20; // At limit first, then under after cleanup
-        },
-      }),
-      cleanup: {
-        makeRoom: async () => ({ removedCount: 5 }),
-        getBreakdown: async () => ({
-          total: 25,
-          merged: 5,
-          stale: 3,
-          active: 17,
-          limit: 25,
-          mergedEnvs: [],
-          staleEnvs: [],
-          activeEnvs: [],
-        }),
-      },
-    });
-
-    const result = await resolver.resolve({
-      existingEnvId: null,
-      codebase: defaultCodebase,
-      hints: { workflowType: 'issue', workflowId: '200' },
-      platformType: 'web',
-    });
-
-    expect(result.status).toBe('resolved');
-    if (result.status === 'resolved') {
-      expect(result.method.type).toBe('created');
-      if (result.method.type === 'created') {
-        expect(result.method.autoCleanedCount).toBe(5);
-      }
-    }
-  });
-
-  test('limit reached, cleanup fails — returns blocked', async () => {
-    const resolver = createResolver({
-      store: makeMockStore({
-        countActiveByCodebase: async () => 25,
-      }),
-      cleanup: {
-        makeRoom: async () => ({ removedCount: 0 }),
-        getBreakdown: async () => ({
-          total: 25,
-          merged: 0,
-          stale: 2,
-          active: 23,
-          limit: 25,
-          mergedEnvs: [],
-          staleEnvs: [],
-          activeEnvs: [],
-        }),
-      },
-    });
-
-    const result = await resolver.resolve({
-      existingEnvId: null,
-      codebase: defaultCodebase,
-      hints: { workflowType: 'issue', workflowId: '300' },
-      platformType: 'web',
-    });
-
-    expect(result.status).toBe('blocked');
-    if (result.status === 'blocked') {
-      expect(result.reason).toBe('limit_reached');
-      expect(result.userMessage).toContain('Worktree limit reached');
-    }
-  });
-
   test('creation error — returns blocked with creation_failed', async () => {
     const resolver = createResolver({
       provider: {
@@ -414,28 +339,6 @@ describe('IsolationResolver', () => {
     if (result.status === 'blocked') {
       expect(result.reason).toBe('creation_failed');
       expect(result.userMessage).toContain('Permission denied');
-    }
-  });
-
-  test('no cleanup provided, at limit — returns blocked immediately', async () => {
-    const resolver = createResolver({
-      store: makeMockStore({
-        countActiveByCodebase: async () => 25,
-      }),
-      cleanup: undefined,
-    });
-
-    const result = await resolver.resolve({
-      existingEnvId: null,
-      codebase: defaultCodebase,
-      hints: { workflowType: 'issue', workflowId: '500' },
-      platformType: 'web',
-    });
-
-    expect(result.status).toBe('blocked');
-    if (result.status === 'blocked') {
-      expect(result.reason).toBe('limit_reached');
-      expect(result.userMessage).toContain('No auto-cleanup available');
     }
   });
 
@@ -725,29 +628,169 @@ describe('IsolationResolver', () => {
     }
   });
 
+  // --- codebaseName propagation test ---
+
+  test('passes codebaseName from codebase to isolation request', async () => {
+    const capturedRequests: unknown[] = [];
+    const resolver = createResolver({
+      provider: {
+        ...makeMockProvider(),
+        create: async (request: unknown) => {
+          capturedRequests.push(request);
+          return {
+            id: '/worktrees/new-branch',
+            provider: 'worktree' as const,
+            workingPath: '/worktrees/new-branch',
+            branchName: 'new-branch',
+            status: 'active' as const,
+            createdAt: new Date(),
+            metadata: { adopted: false },
+          };
+        },
+      },
+    });
+
+    worktreeExistsSpy.mockResolvedValue(false);
+
+    await resolver.resolve({
+      existingEnvId: null,
+      codebase: { id: 'cb-1', name: 'owner/repo', defaultCwd: '/local/repo' },
+      hints: { workflowType: 'task', workflowId: 'wf-1' },
+      platformType: 'web',
+    });
+
+    expect(capturedRequests).toHaveLength(1);
+    expect(capturedRequests[0]).toMatchObject({ codebaseName: 'owner/repo' });
+  });
+
   // --- Constructor validation tests ---
 
-  test('throws on zero maxWorktreesPerCodebase', () => {
+  test('throws on zero staleThresholdDays', () => {
     expect(
       () =>
         new IsolationResolver({
           store: makeMockStore(),
           provider: makeMockProvider(),
-          maxWorktreesPerCodebase: 0,
+          staleThresholdDays: 0,
         })
-    ).toThrow('maxWorktreesPerCodebase must be positive, got 0');
+    ).toThrow('staleThresholdDays must be positive, got 0');
   });
 
-  test('throws on negative maxWorktreesPerCodebase', () => {
+  test('throws on negative staleThresholdDays', () => {
     expect(
       () =>
         new IsolationResolver({
           store: makeMockStore(),
           provider: makeMockProvider(),
-          maxWorktreesPerCodebase: -5,
+          staleThresholdDays: -1,
         })
-    ).toThrow('maxWorktreesPerCodebase must be positive, got -5');
+    ).toThrow('staleThresholdDays must be positive, got -1');
   });
+});
+  test('existing env — emits warning when base branch mismatches', async () => {
+    const env = makeEnvRow();
+    isAncestorOfSpy.mockResolvedValue(false);
+    const resolver = createResolver({
+      store: makeMockStore({ getById: async () => env }),
+    });
+
+    const result = await resolver.resolve({
+      existingEnvId: 'env-1',
+      codebase: defaultCodebase,
+      hints: { baseBranch: git.toBranchName('dev') },
+      platformType: 'web',
+    });
+
+    expect(result.status).toBe('resolved');
+    if (result.status === 'resolved') {
+      expect(result.warnings).toBeDefined();
+      expect(result.warnings?.[0]).toContain("not based on 'dev'");
+    }
+  });
+
+  test('existing env — no warning when base branch matches', async () => {
+    const env = makeEnvRow();
+    isAncestorOfSpy.mockResolvedValue(true);
+    const resolver = createResolver({
+      store: makeMockStore({ getById: async () => env }),
+    });
+
+    const result = await resolver.resolve({
+      existingEnvId: 'env-1',
+      codebase: defaultCodebase,
+      hints: { baseBranch: git.toBranchName('dev') },
+      platformType: 'web',
+    });
+
+    expect(result.status).toBe('resolved');
+    if (result.status === 'resolved') {
+      expect(result.warnings).toBeUndefined();
+    }
+  });
+
+  test('workflow reuse — emits warning when base branch mismatches', async () => {
+    const env = makeEnvRow();
+    isAncestorOfSpy.mockResolvedValue(false);
+    const resolver = createResolver({
+      store: makeMockStore({
+        findActiveByWorkflow: async (_cid, wt, wid) =>
+          wt === 'issue' && wid === '42' ? env : null,
+      }),
+    });
+
+    const result = await resolver.resolve({
+      existingEnvId: null,
+      codebase: defaultCodebase,
+      hints: { workflowType: 'issue', workflowId: '42', baseBranch: git.toBranchName('dev') },
+      platformType: 'web',
+    });
+
+    expect(result.status).toBe('resolved');
+    if (result.status === 'resolved') {
+      expect(result.warnings).toBeDefined();
+      expect(result.warnings?.[0]).toContain("not based on 'dev'");
+    }
+  });
+
+  test('workflow reuse — no warning when base branch matches', async () => {
+    const env = makeEnvRow();
+    isAncestorOfSpy.mockResolvedValue(true);
+    const resolver = createResolver({
+      store: makeMockStore({
+        findActiveByWorkflow: async (_cid, wt, wid) =>
+          wt === 'issue' && wid === '42' ? env : null,
+      }),
+    });
+
+    const result = await resolver.resolve({
+      existingEnvId: null,
+      codebase: defaultCodebase,
+      hints: { workflowType: 'issue', workflowId: '42', baseBranch: git.toBranchName('dev') },
+      platformType: 'web',
+    });
+
+    expect(result.status).toBe('resolved');
+    if (result.status === 'resolved') {
+      expect(result.warnings).toBeUndefined();
+    }
+  });
+
+  test('existing env — no base branch check when baseBranch not in hints', async () => {
+    const env = makeEnvRow();
+    const resolver = createResolver({
+      store: makeMockStore({ getById: async () => env }),
+    });
+
+    await resolver.resolve({
+      existingEnvId: 'env-1',
+      codebase: defaultCodebase,
+      platformType: 'web',
+    });
+
+    expect(isAncestorOfSpy).not.toHaveBeenCalled();
+  });
+
+  // --- Constructor validation tests ---
 
   test('throws on zero staleThresholdDays', () => {
     expect(

@@ -5,16 +5,24 @@ import { Workflow } from 'lucide-react';
 import {
   listDashboardRuns,
   cancelWorkflowRun,
+  resumeWorkflowRun,
+  abandonWorkflowRun,
+  deleteWorkflowRun,
+  approveWorkflowRun,
+  rejectWorkflowRun,
   listCodebases,
   getHealth,
   type DashboardCounts,
   type DashboardRunResponse,
 } from '@/lib/api';
 import type { WorkflowRunStatus } from '@/lib/types';
+import { ensureUtc } from '@/lib/format';
 import { StatusSummaryBar } from '@/components/dashboard/StatusSummaryBar';
 import { WorkflowRunGroup } from '@/components/dashboard/WorkflowRunGroup';
 import { WorkflowRunCard } from '@/components/dashboard/WorkflowRunCard';
 import { WorkflowHistoryTable } from '@/components/dashboard/WorkflowHistoryTable';
+import { useDashboardSSE } from '@/hooks/useDashboardSSE';
+import { useWorkflowStore } from '@/stores/workflow-store';
 
 const DEFAULT_PAGE_SIZE = 10;
 const PAGE_SIZE_OPTIONS = [10, 25, 50] as const;
@@ -39,6 +47,11 @@ function getDateBounds(range: DateRange): { after?: string; before?: string } {
 export function DashboardPage(): React.ReactElement {
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
+
+  // Connect to multiplexed dashboard SSE stream (all workflow events → Zustand store)
+  useDashboardSSE();
+
+  const hydrateWorkflow = useWorkflowStore(state => state.hydrateWorkflow);
 
   // Hydrate filter state from URL (supports bookmarkable views)
   const statusFilter = searchParams.get('status') ?? null;
@@ -171,7 +184,26 @@ export function DashboardPage(): React.ReactElement {
     failed: 0,
     cancelled: 0,
     pending: 0,
+    paused: 0,
   };
+
+  // Hydrate Zustand store from REST-polled data for active runs.
+  // Only sets initial state if the run isn't already tracked by SSE.
+  useEffect(() => {
+    for (const run of runs) {
+      if (run.status === 'running' || run.status === 'pending' || run.status === 'paused') {
+        hydrateWorkflow({
+          runId: run.id,
+          workflowName: run.workflow_name,
+          status: run.status,
+          dagNodes: [],
+          artifacts: [],
+          startedAt: new Date(ensureUtc(run.started_at)).getTime(),
+          currentTool: null,
+        });
+      }
+    }
+  }, [runs, hydrateWorkflow]);
 
   const { data: codebases } = useQuery({
     queryKey: ['codebases'],
@@ -180,13 +212,16 @@ export function DashboardPage(): React.ReactElement {
 
   const { data: health } = useQuery({
     queryKey: ['health'],
-    queryFn: () => getHealth(),
+    queryFn: getHealth,
+    staleTime: 10_000,
+    refetchOnWindowFocus: true,
     refetchInterval: 30_000,
   });
 
   // Split into active and history (from server-filtered results)
   const activeRuns = useMemo(
-    () => runs.filter(r => r.status === 'running' || r.status === 'pending'),
+    () =>
+      runs.filter(r => r.status === 'running' || r.status === 'pending' || r.status === 'paused'),
     [runs]
   );
 
@@ -232,18 +267,34 @@ export function DashboardPage(): React.ReactElement {
     [runs]
   );
 
-  const [cancelError, setCancelError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
-  const handleCancel = async (runId: string): Promise<void> => {
+  async function runAction(
+    action: (runId: string) => Promise<unknown>,
+    runId: string,
+    fallbackMessage: string
+  ): Promise<void> {
     try {
-      setCancelError(null);
-      await cancelWorkflowRun(runId);
+      setActionError(null);
+      await action(runId);
       void queryClient.invalidateQueries({ queryKey: ['dashboardRuns'] });
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to cancel workflow';
-      setCancelError(message);
+      setActionError(err instanceof Error ? err.message : fallbackMessage);
     }
-  };
+  }
+
+  const handleCancel = (runId: string): Promise<void> =>
+    runAction(cancelWorkflowRun, runId, 'Failed to cancel workflow');
+  const handleResume = (runId: string): Promise<void> =>
+    runAction(resumeWorkflowRun, runId, 'Failed to resume workflow');
+  const handleAbandon = (runId: string): Promise<void> =>
+    runAction(abandonWorkflowRun, runId, 'Failed to abandon workflow');
+  const handleDelete = (runId: string): Promise<void> =>
+    runAction(deleteWorkflowRun, runId, 'Failed to delete workflow run');
+  const handleApprove = (runId: string): Promise<void> =>
+    runAction(approveWorkflowRun, runId, 'Failed to approve workflow');
+  const handleReject = (runId: string): Promise<void> =>
+    runAction(rejectWorkflowRun, runId, 'Failed to reject workflow');
 
   const totalPages = Math.ceil(total / pageSize);
   const hasMore = page + 1 < totalPages;
@@ -276,9 +327,9 @@ export function DashboardPage(): React.ReactElement {
           health={health}
         />
 
-        {cancelError && (
+        {actionError && (
           <div className="rounded-md border border-error/30 bg-error/5 px-4 py-3 text-sm text-error">
-            {cancelError}
+            {actionError}
           </div>
         )}
 
@@ -309,7 +360,17 @@ export function DashboardPage(): React.ReactElement {
                   {singletonRuns.length > 0 && (
                     <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                       {singletonRuns.map(run => (
-                        <WorkflowRunCard key={run.id} run={run} onCancel={handleCancel} />
+                        <WorkflowRunCard
+                          key={run.id}
+                          run={run}
+                          isDocker={health?.is_docker}
+                          onCancel={handleCancel}
+                          onResume={handleResume}
+                          onAbandon={handleAbandon}
+                          onDelete={handleDelete}
+                          onApprove={handleApprove}
+                          onReject={handleReject}
+                        />
                       ))}
                     </div>
                   )}
@@ -319,7 +380,13 @@ export function DashboardPage(): React.ReactElement {
                       key={group.parentPlatformId ?? 'standalone'}
                       parentPlatformId={group.parentPlatformId}
                       runs={group.runs}
+                      isDocker={health?.is_docker}
                       onCancel={handleCancel}
+                      onResume={handleResume}
+                      onAbandon={handleAbandon}
+                      onDelete={handleDelete}
+                      onApprove={handleApprove}
+                      onReject={handleReject}
                     />
                   ))}
                 </div>
@@ -330,7 +397,7 @@ export function DashboardPage(): React.ReactElement {
             {historyRuns.length > 0 && (
               <section>
                 <h2 className="mb-3 text-sm font-semibold text-text-secondary">History</h2>
-                <WorkflowHistoryTable runs={historyRuns} />
+                <WorkflowHistoryTable runs={historyRuns} onDelete={handleDelete} />
               </section>
             )}
 

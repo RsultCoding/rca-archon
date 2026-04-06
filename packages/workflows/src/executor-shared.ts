@@ -12,7 +12,7 @@ import * as archonPaths from '@archon/paths';
 import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
 import { createLogger } from '@archon/paths';
 import { isValidCommandName } from './command-validation';
-import type { LoadCommandResult } from './types';
+import type { LoadCommandResult } from './schemas';
 
 /** Lazy-initialized logger */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -78,6 +78,31 @@ export function classifyError(error: Error): ErrorType {
     return 'TRANSIENT';
   }
   return 'UNKNOWN';
+}
+
+// ─── Credit Exhaustion Detection ────────────────────────────────────────────
+
+/** Patterns that indicate credit/quota exhaustion in streamed assistant output */
+const CREDIT_EXHAUSTION_OUTPUT_PATTERNS = [
+  "you're out of extra usage",
+  'out of credits',
+  'credit balance',
+  'insufficient credit',
+];
+
+/**
+ * Detect credit exhaustion in streamed node output text.
+ *
+ * The Claude SDK returns credit exhaustion as a normal assistant text message
+ * rather than throwing. This function checks the accumulated output for known
+ * credit exhaustion phrases.
+ */
+export function detectCreditExhaustion(text: string): string | null {
+  const lower = text.toLowerCase();
+  if (CREDIT_EXHAUSTION_OUTPUT_PATTERNS.some(p => lower.includes(p))) {
+    return 'Credit exhaustion detected — resume when credits reset';
+  }
+  return null;
 }
 
 // ─── Command Loading ─────────────────────────────────────────────────────────
@@ -228,6 +253,9 @@ export const CONTEXT_VAR_PATTERN_STR = '\\$(?:CONTEXT|EXTERNAL_CONTEXT|ISSUE_CON
  * - $ARTIFACTS_DIR - External artifacts directory for this workflow run
  * - $BASE_BRANCH - The base branch (from config or auto-detected)
  * - $CONTEXT, $EXTERNAL_CONTEXT, $ISSUE_CONTEXT - GitHub issue/PR context (if available)
+ * - $LOOP_USER_INPUT - User feedback from interactive loop approval. Only populated on the
+ *   first iteration of a resumed interactive loop; empty string on all other iterations.
+ * - $REJECTION_REASON - Reviewer feedback from approval node rejection (on_reject prompts only).
  *
  * When issueContext is undefined, context variables are replaced with empty string
  * to avoid sending literal "$CONTEXT" to the AI.
@@ -238,7 +266,9 @@ export function substituteWorkflowVariables(
   userMessage: string,
   artifactsDir: string,
   baseBranch: string,
-  issueContext?: string
+  issueContext?: string,
+  loopUserInput?: string,
+  rejectionReason?: string
 ): { prompt: string; contextSubstituted: boolean } {
   // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved
   if (!baseBranch && prompt.includes('$BASE_BRANCH')) {
@@ -254,7 +284,9 @@ export function substituteWorkflowVariables(
     .replace(/\$USER_MESSAGE/g, userMessage)
     .replace(/\$ARGUMENTS/g, userMessage)
     .replace(/\$ARTIFACTS_DIR/g, artifactsDir)
-    .replace(/\$BASE_BRANCH/g, baseBranch);
+    .replace(/\$BASE_BRANCH/g, baseBranch)
+    .replace(/\$LOOP_USER_INPUT/g, loopUserInput ?? '')
+    .replace(/\$REJECTION_REASON/g, rejectionReason ?? '');
 
   // Check if context variables exist (use fresh regex to avoid lastIndex issues)
   const hasContextVariables = new RegExp(CONTEXT_VAR_PATTERN_STR).test(result);
@@ -315,4 +347,44 @@ export function buildPromptWithContext(
   }
 
   return prompt;
+}
+
+// ─── Completion Signal Detection ────────────────────────────────────────────
+
+/**
+ * Escape special regex characters in string
+ */
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Detect whether the AI output contains a completion signal.
+ *
+ * Supports two formats:
+ * 1. <promise>SIGNAL</promise> - Recommended; prevents false positives in prose
+ * 2. Plain SIGNAL - Backwards compatibility; only at end of output or on own line
+ *
+ * The <promise> tag format uses case-insensitive matching for the tags.
+ * Plain signal detection is restrictive to prevent false positives.
+ */
+export function detectCompletionSignal(output: string, signal: string): boolean {
+  // Check for <promise>SIGNAL</promise> format (recommended - prevents false positives)
+  // Case-insensitive for tags
+  const promisePattern = new RegExp(`<promise>\\s*${escapeRegExp(signal)}\\s*</promise>`, 'i');
+  if (promisePattern.test(output)) {
+    return true;
+  }
+  // Plain signal detection - restrictive to prevent false positives like "not COMPLETE yet"
+  // Only matches if signal is:
+  // 1. At the very end of output (with optional trailing whitespace/punctuation)
+  // 2. On its own line
+  const endPattern = new RegExp(`${escapeRegExp(signal)}[\\s.,;:!?]*$`);
+  const ownLinePattern = new RegExp(`^\\s*${escapeRegExp(signal)}\\s*$`, 'm');
+  return endPattern.test(output) || ownLinePattern.test(output);
+}
+
+/** Strip internal completion signal tags before sending to user-facing output. */
+export function stripCompletionTags(content: string): string {
+  return content.replace(/<promise>[\s\S]*?<\/promise>/gi, '').trim();
 }

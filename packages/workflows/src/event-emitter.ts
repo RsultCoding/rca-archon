@@ -10,7 +10,7 @@
  * - Conversation-scoped subscriptions via registerRun() mapping
  */
 import { EventEmitter } from 'events';
-import type { ArtifactType } from './types';
+import type { ArtifactType } from './schemas';
 import { createLogger } from '@archon/paths';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -29,8 +29,6 @@ interface WorkflowStartedEvent {
   runId: string;
   workflowName: string;
   conversationId: string;
-  totalSteps: number;
-  isLoop: boolean;
 }
 
 interface WorkflowCompletedEvent {
@@ -45,65 +43,12 @@ interface WorkflowFailedEvent {
   runId: string;
   workflowName: string;
   error: string;
-  stepIndex?: number;
-}
-
-interface StepStartedEvent {
-  type: 'step_started';
-  runId: string;
-  stepIndex: number;
-  stepName: string;
-  totalSteps: number;
-}
-
-interface StepCompletedEvent {
-  type: 'step_completed';
-  runId: string;
-  stepIndex: number;
-  stepName: string;
-  totalSteps: number;
-  duration: number;
-}
-
-interface StepFailedEvent {
-  type: 'step_failed';
-  runId: string;
-  stepIndex: number;
-  stepName: string;
-  totalSteps: number;
-  error: string;
-}
-
-interface ParallelAgentStartedEvent {
-  type: 'parallel_agent_started';
-  runId: string;
-  stepIndex: number;
-  agentIndex: number;
-  totalAgents: number;
-  agentName: string;
-}
-
-interface ParallelAgentCompletedEvent {
-  type: 'parallel_agent_completed';
-  runId: string;
-  stepIndex: number;
-  agentIndex: number;
-  agentName: string;
-  duration: number;
-}
-
-interface ParallelAgentFailedEvent {
-  type: 'parallel_agent_failed';
-  runId: string;
-  stepIndex: number;
-  agentIndex: number;
-  agentName: string;
-  error: string;
 }
 
 interface LoopIterationStartedEvent {
   type: 'loop_iteration_started';
   runId: string;
+  nodeId?: string; // present when loop runs as a DAG node
   iteration: number;
   maxIterations: number;
 }
@@ -111,6 +56,7 @@ interface LoopIterationStartedEvent {
 interface LoopIterationCompletedEvent {
   type: 'loop_iteration_completed';
   runId: string;
+  nodeId?: string; // present when loop runs as a DAG node
   iteration: number;
   duration: number;
   completionDetected: boolean;
@@ -119,6 +65,7 @@ interface LoopIterationCompletedEvent {
 interface LoopIterationFailedEvent {
   type: 'loop_iteration_failed';
   runId: string;
+  nodeId?: string; // present when loop runs as a DAG node
   iteration: number;
   error: string;
 }
@@ -160,27 +107,54 @@ interface NodeSkippedEvent {
   runId: string;
   nodeId: string;
   nodeName: string;
-  reason: 'when_condition' | 'when_condition_parse_error' | 'trigger_rule';
+  reason: 'when_condition' | 'when_condition_parse_error' | 'trigger_rule' | 'prior_success';
+}
+
+interface ToolStartedEvent {
+  type: 'tool_started';
+  runId: string;
+  toolName: string;
+  stepName: string;
+}
+
+interface ToolCompletedEvent {
+  type: 'tool_completed';
+  runId: string;
+  toolName: string;
+  stepName: string;
+  durationMs: number;
+}
+
+interface ApprovalPendingEvent {
+  type: 'approval_pending';
+  runId: string;
+  nodeId: string;
+  message: string;
+}
+
+interface WorkflowCancelledEvent {
+  type: 'workflow_cancelled';
+  runId: string;
+  nodeId: string;
+  reason: string;
 }
 
 export type WorkflowEmitterEvent =
   | WorkflowStartedEvent
   | WorkflowCompletedEvent
   | WorkflowFailedEvent
-  | StepStartedEvent
-  | StepCompletedEvent
-  | StepFailedEvent
-  | ParallelAgentStartedEvent
-  | ParallelAgentCompletedEvent
-  | ParallelAgentFailedEvent
   | LoopIterationStartedEvent
   | LoopIterationCompletedEvent
+  | LoopIterationFailedEvent
   | NodeStartedEvent
   | NodeCompletedEvent
   | NodeFailedEvent
   | NodeSkippedEvent
-  | LoopIterationFailedEvent
-  | WorkflowArtifactEvent;
+  | WorkflowArtifactEvent
+  | ToolStartedEvent
+  | ToolCompletedEvent
+  | ApprovalPendingEvent
+  | WorkflowCancelledEvent;
 
 // ---------------------------------------------------------------------------
 // Emitter class

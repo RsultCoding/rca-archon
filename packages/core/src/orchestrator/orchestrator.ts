@@ -48,7 +48,8 @@ import * as db from '../db/conversations';
 import { createIsolationStore } from '../db/isolation-environments';
 import { toError } from '../utils/error';
 import { getCodebase } from '../db/codebases';
-import { executeWorkflow, type WorkflowDefinition } from '@archon/workflows';
+import { executeWorkflow } from '@archon/workflows/executor';
+import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import { createWorkflowDeps } from '../workflows/store-adapter';
 import {
   cleanupToMakeRoom,
@@ -376,7 +377,7 @@ export async function dispatchBackgroundWorkflow(
           preCreatedRun
         );
         // Surface workflow output to parent conversation as a result card
-        if (result.success && result.summary) {
+        if (result.success && !('paused' in result) && result.summary) {
           try {
             await ctx.platform.sendMessage(ctx.conversationId, result.summary, {
               category: 'workflow_result',

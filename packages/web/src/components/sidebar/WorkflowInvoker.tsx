@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
 import { Loader2 } from 'lucide-react';
 import { listWorkflows, createConversation, runWorkflow, deleteConversation } from '@/lib/api';
+import { useProject } from '@/contexts/ProjectContext';
 
 interface WorkflowInvokerProps {
   codebaseId?: string;
@@ -10,14 +11,17 @@ interface WorkflowInvokerProps {
 
 export function WorkflowInvoker({ codebaseId }: WorkflowInvokerProps): React.ReactElement | null {
   const navigate = useNavigate();
+  const { codebases } = useProject();
   const [selectedWorkflow, setSelectedWorkflow] = useState<string | null>(null);
   const [message, setMessage] = useState('');
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const cwd = codebaseId ? codebases?.find(cb => cb.id === codebaseId)?.default_cwd : undefined;
+
   const { data: workflows, isError: isErrorWorkflows } = useQuery({
-    queryKey: ['workflows'],
-    queryFn: () => listWorkflows(),
+    queryKey: ['workflows', cwd ?? null],
+    queryFn: () => listWorkflows(cwd),
     refetchInterval: 30_000,
   });
 
@@ -67,9 +71,9 @@ export function WorkflowInvoker({ codebaseId }: WorkflowInvokerProps): React.Rea
         className="w-full rounded-md border border-border bg-surface-elevated px-2 py-1.5 text-xs text-text-secondary focus:outline-none focus:ring-1 focus:ring-accent"
       >
         <option value="">Run workflow...</option>
-        {workflows.map(wf => (
-          <option key={wf.name} value={wf.name}>
-            {wf.name}
+        {workflows.map(entry => (
+          <option key={entry.workflow.name} value={entry.workflow.name}>
+            {entry.workflow.name}
           </option>
         ))}
       </select>

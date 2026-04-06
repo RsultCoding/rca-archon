@@ -1,9 +1,8 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router';
 import { MessageSquare } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { isDagWorkflow } from '@archon/workflows/types';
-import { StepProgress } from './StepProgress';
+
 import { DagNodeProgress } from './DagNodeProgress';
 import { StepLogs } from './StepLogs';
 import { WorkflowLogs } from './WorkflowLogs';
@@ -15,6 +14,7 @@ import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from '@/componen
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { getWorkflowRun, getWorkflowRunByWorker, getCodebase, getWorkflow } from '@/lib/api';
 import { ensureUtc, formatDurationMs } from '@/lib/format';
+import { selectInitialNode } from '@/lib/select-initial-node';
 import type {
   WorkflowState,
   ArtifactType,
@@ -22,6 +22,7 @@ import type {
   DagNodeState,
   WorkflowStepStatus,
 } from '@/lib/types';
+
 import type { WorkflowEventResponse } from '@/lib/api';
 
 /** Tool call event extracted from workflow_events for display in WorkflowLogs. */
@@ -75,23 +76,24 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const liveWorkflow = useWorkflowStore(s => s.workflows.get(runId));
-  const [selectedStep, setSelectedStep] = useState(0);
   const [selectedDagNode, setSelectedDagNode] = useState<string | null>(null);
   const [codebaseName, setCodebaseName] = useState<string | null>(null);
   const [codebaseCwd, setCodebaseCwd] = useState<string | null>(null);
   const [workerRunId, setWorkerRunId] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<'graph' | 'logs' | 'chat'>('graph');
+  // Increments on every user-initiated node click to trigger scroll in WorkflowLogs
+  const [nodeScrollTrigger, setNodeScrollTrigger] = useState(0);
   // Track which codebaseId we've already fetched to avoid stale re-fetches during runId transitions
   const fetchedCodebaseIdRef = useRef<string | null>(null);
 
   // Reset local state when navigating to a different workflow run
   useEffect(() => {
-    setSelectedStep(0);
     setSelectedDagNode(null);
     setCodebaseName(null);
     setCodebaseCwd(null);
     setWorkerRunId(null);
     setActiveView('graph');
+    setNodeScrollTrigger(0);
     fetchedCodebaseIdRef.current = null;
   }, [runId]);
 
@@ -105,43 +107,6 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
           runId: data.run.id,
           workflowName: data.run.workflow_name,
           status: data.run.status,
-          steps: ((): {
-            index: number;
-            name: string;
-            status: 'running' | 'completed' | 'failed';
-            duration?: number;
-          }[] => {
-            const stepMap = new Map<
-              number,
-              {
-                index: number;
-                name: string;
-                status: 'running' | 'completed' | 'failed';
-                duration?: number;
-              }
-            >();
-            for (const e of data.events.filter(
-              ev => ev.event_type.startsWith('step_') || ev.event_type.startsWith('loop_iteration_')
-            )) {
-              const idx = e.step_index ?? 0;
-              const existing = stepMap.get(idx);
-              const status =
-                e.event_type === 'step_started' || e.event_type === 'loop_iteration_started'
-                  ? ('running' as const)
-                  : e.event_type === 'step_completed' || e.event_type === 'loop_iteration_completed'
-                    ? ('completed' as const)
-                    : ('failed' as const);
-              if (!existing || status !== 'running') {
-                stepMap.set(idx, {
-                  index: idx,
-                  name: e.step_name ?? `Step ${String(idx + 1)}`,
-                  status,
-                  duration: e.data.duration_ms as number | undefined,
-                });
-              }
-            }
-            return Array.from(stepMap.values()).sort((a, b) => a.index - b.index);
-          })(),
           dagNodes: ((): DagNodeState[] => {
             const nodeMap = new Map<string, DagNodeState>();
             for (const e of data.events.filter(ev => ev.event_type.startsWith('node_'))) {
@@ -182,7 +147,6 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
               };
             })
             .filter(a => a.label || a.url || a.path),
-          isLoop: data.events.some(ev => ev.event_type.startsWith('loop_iteration_')),
           startedAt: new Date(ensureUtc(data.run.started_at)).getTime(),
           completedAt: data.run.completed_at
             ? new Date(ensureUtc(data.run.completed_at)).getTime()
@@ -277,12 +241,8 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
     enabled: !!initialData?.workflowName && !!codebaseCwd,
     staleTime: Infinity,
   });
-  const dagDefinitionNodes =
-    workflowDef?.workflow && isDagWorkflow(workflowDef.workflow)
-      ? workflowDef.workflow.nodes
-      : null;
+  const dagDefinitionNodes = workflowDef?.workflow?.nodes ?? null;
   // Use workflow definition when available, fall back to dagNodes from run state.
-  // isDagWorkflow() operates on the definition; dagNodes.length operates on run state.
   const isDag = dagDefinitionNodes !== null || (initialData?.dagNodes.length ?? 0) > 0;
 
   // When SSE reports a terminal status but React Query data is still stale,
@@ -336,16 +296,23 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
       status: liveWorkflow.status,
       completedAt: liveWorkflow.completedAt ?? initialData.completedAt,
       error: liveWorkflow.error ?? initialData.error,
-      // SSE accumulates steps/artifacts/dagNodes incrementally — prefer them when populated,
+      // SSE accumulates dagNodes/artifacts incrementally — prefer them when populated,
       // otherwise fall back to the REST snapshot.
-      steps: liveWorkflow.steps.length > 0 ? liveWorkflow.steps : initialData.steps,
       dagNodes: liveWorkflow.dagNodes.length > 0 ? liveWorkflow.dagNodes : initialData.dagNodes,
       artifacts: liveWorkflow.artifacts.length > 0 ? liveWorkflow.artifacts : initialData.artifacts,
-      isLoop: liveWorkflow.isLoop || initialData.isLoop,
+
       currentIteration: liveWorkflow.currentIteration ?? initialData.currentIteration,
       maxIterations: liveWorkflow.maxIterations ?? initialData.maxIterations,
     };
   })();
+
+  // Auto-select the first DAG node when workflow data loads and no node is selected.
+  // Prefer the currently executing node (for running workflows), otherwise pick the first node.
+  useEffect(() => {
+    if (selectedDagNode !== null) return;
+    const nodeId = selectInitialNode(workflow?.dagNodes);
+    if (nodeId) setSelectedDagNode(nodeId);
+  }, [selectedDagNode, workflow?.dagNodes]);
 
   // Force re-render every second while workflow is running (for live timer)
   const [, setTick] = useState(0);
@@ -395,51 +362,19 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
       }
     }
 
-    // Fallback for sequential workflows: check step events
-    if (workflow) {
-      for (const step of workflow.steps) {
-        if (step.status === 'running') {
-          return { nodeName: step.name, startedAt: workflow.startedAt };
-        }
-      }
-    }
-
     return null;
-  }, [queryData?.events, workflow?.status, workflow?.steps, workflow?.startedAt]);
+  }, [queryData?.events, workflow?.status]);
 
-  // Compute formatted log lines for the selected step/node from DB events.
-  // DAG node events have step_index=null; filter by step_name when a DAG node is selected.
+  // Compute formatted log lines for the selected DAG node from DB events.
   const stepLogLines = useMemo((): string[] => {
     const events = queryData?.events ?? [];
     const stepEvents =
-      selectedDagNode !== null
-        ? events.filter(e => e.step_name === selectedDagNode)
-        : events.filter(e => e.step_index === selectedStep);
+      selectedDagNode !== null ? events.filter(e => e.step_name === selectedDagNode) : [];
     if (stepEvents.length === 0) return [];
 
     return stepEvents.map(e => {
       const ts = new Date(ensureUtc(e.created_at)).toLocaleTimeString();
       switch (e.event_type) {
-        case 'step_started':
-          return `[${ts}] Step started: ${e.step_name ?? `step ${String(selectedStep + 1)}`}`;
-        case 'step_completed': {
-          const dur = e.data.duration_ms as number | undefined;
-          const durStr = dur !== undefined ? ` (${String(Math.round(dur / 100) / 10)}s)` : '';
-          return `[${ts}] Step completed${durStr}`;
-        }
-        case 'step_failed':
-          return `[${ts}] Step failed: ${(e.data.error as string | undefined) ?? 'Unknown error'}`;
-        case 'step_skipped_prior_success':
-          return `[${ts}] Step skipped (already completed in prior run)`;
-        case 'parallel_agent_started':
-          return `[${ts}] Agent ${String((e.data.agentIndex as number) + 1)}/${String(e.data.totalAgents)}: ${e.step_name ?? 'parallel agent'} started`;
-        case 'parallel_agent_completed': {
-          const dur = e.data.duration_ms as number | undefined;
-          const durStr = dur !== undefined ? ` (${String(Math.round(dur / 100) / 10)}s)` : '';
-          return `[${ts}] Agent ${String((e.data.agentIndex as number) + 1)}/${String(e.data.totalAgents)}: ${e.step_name ?? 'parallel agent'} completed${durStr}`;
-        }
-        case 'parallel_agent_failed':
-          return `[${ts}] Agent ${String((e.data.agentIndex as number) + 1)}/${String(e.data.totalAgents)}: ${e.step_name ?? 'parallel agent'} failed: ${(e.data.error as string | undefined) ?? 'Unknown error'}`;
         case 'loop_iteration_started':
           return `[${ts}] Iteration ${String(e.data.iteration)}/${String((e.data.maxIterations as number | undefined) ?? '?')} started`;
         case 'loop_iteration_completed': {
@@ -461,20 +396,38 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
           return `[${ts}] ${e.event_type}${e.step_name ? `: ${e.step_name}` : ''}`;
       }
     });
-  }, [queryData?.events, selectedStep, selectedDagNode]);
+  }, [queryData?.events, selectedDagNode]);
 
-  // When logsPlatformId is set, WorkflowLogs shows the full SSE stream and ignores selectedStep.
-  // Detect whether the selected step/node has any DB events so we can show an empty-state
-  // overlay when a step has no output. Guard with isRunning so we never hide the live stream
-  // for a currently-executing step that hasn't emitted events yet.
+  // Detect whether the selected node has any DB events so we can show an empty-state
+  // overlay when a node has no output. Guard with isRunning so we never hide the live stream
+  // for a currently-executing node that hasn't emitted events yet.
   const selectedStepHasEvents = useMemo((): boolean => {
-    if (!queryData?.events) return false;
-    const events = queryData.events;
-    if (selectedDagNode !== null) {
-      return events.some(e => e.step_name === selectedDagNode);
+    if (!queryData?.events || selectedDagNode === null) return false;
+    return queryData.events.some(e => e.step_name === selectedDagNode);
+  }, [queryData?.events, selectedDagNode]);
+
+  // Compute start timestamps for each DAG node from workflow events.
+  // Used to scroll the logs panel to the right position when a node is selected.
+  const nodeStartTimes = useMemo((): Map<string, number> => {
+    const map = new Map<string, number>();
+    for (const e of queryData?.events ?? []) {
+      if (e.event_type === 'node_started' && e.step_name) {
+        map.set(e.step_name, new Date(ensureUtc(e.created_at)).getTime());
+      }
     }
-    return events.some(e => e.step_index === selectedStep);
-  }, [queryData?.events, selectedStep, selectedDagNode]);
+    return map;
+  }, [queryData?.events]);
+
+  const scrollToNodeTimestamp = selectedDagNode
+    ? (nodeStartTimes.get(selectedDagNode) ?? null)
+    : null;
+
+  // Handler for user-initiated node clicks (graph or sidebar).
+  // Increments scroll trigger so WorkflowLogs scrolls to the node's section.
+  const handleNodeClick = useCallback((nodeId: string): void => {
+    setSelectedDagNode(nodeId);
+    setNodeScrollTrigger(prev => prev + 1);
+  }, []);
 
   if (error) {
     return (
@@ -508,7 +461,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
   // Pick the platform ID for logs: worker takes precedence over conversation.
   const logsPlatformId = workerPlatformId ?? conversationPlatformId;
 
-  // Logs panel — shared between graph split and standalone logs view
+  // Logs panel — detect whether the selected node has any DB events so we can show an empty-state
   const logsPanel = (
     <div className="flex-1 flex flex-col overflow-hidden min-h-0 h-full">
       <div className="flex-1 flex flex-col overflow-hidden min-h-0">
@@ -523,14 +476,16 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
             isRunning={isRunning}
             currentlyExecuting={currentlyExecuting}
             toolEvents={toolEvents}
+            scrollToNodeTimestamp={scrollToNodeTimestamp}
+            nodeScrollTrigger={nodeScrollTrigger}
           />
         ) : (
-          <StepLogs runId={runId} stepIndex={selectedStep} lines={stepLogLines} />
+          <StepLogs runId={runId} lines={stepLogLines} />
         )}
       </div>
       {!isRunning && workflow.artifacts.length > 0 && (
         <div className="border-t border-border p-3">
-          <ArtifactSummary artifacts={workflow.artifacts} />
+          <ArtifactSummary artifacts={workflow.artifacts} runId={runId} />
         </div>
       )}
     </div>
@@ -547,6 +502,8 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
                 liveStatus={workflow.dagNodes}
                 isRunning={isRunning}
                 currentlyExecuting={currentlyExecuting ?? undefined}
+                selectedNodeId={selectedDagNode}
+                onNodeClick={handleNodeClick}
               />
             ) : (
               <div className="flex items-center justify-center h-full text-text-secondary">
@@ -564,28 +521,20 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
     }
     if (isDag && activeView === 'chat' && parentPlatformId) {
       return (
-        <div className="flex-1 overflow-hidden min-h-0">
+        <div className="flex flex-col flex-1 overflow-hidden min-h-0">
           <ChatInterface conversationId={parentPlatformId} />
         </div>
       );
     }
-    // Logs view: default for sequential workflows, and the DAG "Logs" tab
+    // Logs view: DAG "Logs" tab
     return (
       <div className="flex flex-1 overflow-hidden min-h-0">
         <div className="w-64 border-r border-border overflow-auto">
-          {workflow.dagNodes.length > 0 ? (
-            <DagNodeProgress
-              nodes={workflow.dagNodes}
-              activeNodeId={selectedDagNode}
-              onNodeClick={setSelectedDagNode}
-            />
-          ) : (
-            <StepProgress
-              steps={workflow.steps}
-              activeStepIndex={selectedStep}
-              onStepClick={setSelectedStep}
-            />
-          )}
+          <DagNodeProgress
+            nodes={workflow.dagNodes}
+            activeNodeId={selectedDagNode}
+            onNodeClick={handleNodeClick}
+          />
         </div>
         {logsPanel}
       </div>
@@ -593,7 +542,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
   };
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full min-h-0 overflow-hidden">
       {/* Header */}
       <div className="flex items-center gap-3 px-4 py-3 border-b border-border">
         <button
@@ -615,19 +564,6 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
         </div>
         <div className="flex items-center gap-2 ml-auto shrink-0">
           {codebaseName && <span className="text-xs text-text-secondary">{codebaseName}</span>}
-          {/* Chat nav button — only for non-DAG workflows (DAG gets a Chat tab) */}
-          {!isDag && parentPlatformId && (
-            <button
-              onClick={(): void => {
-                navigate(`/chat/${encodeURIComponent(parentPlatformId)}`);
-              }}
-              className="flex items-center gap-1 text-xs text-primary hover:text-accent-bright transition-colors"
-              title="View parent conversation"
-            >
-              <MessageSquare className="h-3 w-3" />
-              <span>Chat</span>
-            </button>
-          )}
           {workerRunId && (
             <button
               onClick={(): void => {

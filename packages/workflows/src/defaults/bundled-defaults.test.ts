@@ -1,71 +1,40 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { isBinaryBuild, BUNDLED_COMMANDS, BUNDLED_WORKFLOWS } from './bundled-defaults';
+import { describe, it, expect } from 'bun:test';
+import {
+  isBinaryBuild,
+  isBunVirtualFs,
+  BUNDLED_COMMANDS,
+  BUNDLED_WORKFLOWS,
+} from './bundled-defaults';
 
 describe('bundled-defaults', () => {
+  describe('isBunVirtualFs', () => {
+    it('should detect Linux/macOS virtual filesystem paths', () => {
+      expect(isBunVirtualFs('/$bunfs/root/bundled-defaults')).toBe(true);
+      expect(isBunVirtualFs('/$bunfs/root/')).toBe(true);
+    });
+
+    it('should detect Windows virtual filesystem paths (backslash)', () => {
+      expect(isBunVirtualFs('B:\\~BUN\\root\\bundled-defaults')).toBe(true);
+      expect(isBunVirtualFs('B:\\~BUN\\root')).toBe(true);
+    });
+
+    it('should detect Windows virtual filesystem paths (forward slash)', () => {
+      expect(isBunVirtualFs('B:/~BUN/root/bundled-defaults')).toBe(true);
+      expect(isBunVirtualFs('B:/~BUN/root')).toBe(true);
+    });
+
+    it('should return false for real filesystem paths', () => {
+      expect(isBunVirtualFs('/home/user/project/src')).toBe(false);
+      expect(isBunVirtualFs('C:\\Users\\user\\project\\src')).toBe(false);
+      expect(isBunVirtualFs('/tmp/test')).toBe(false);
+    });
+  });
+
   describe('isBinaryBuild', () => {
-    let originalExecPath: string;
-
-    beforeEach(() => {
-      originalExecPath = process.execPath;
-    });
-
-    afterEach(() => {
-      // Restore original execPath (note: this is read-only in practice, but tests may mock it)
-      Object.defineProperty(process, 'execPath', { value: originalExecPath, writable: true });
-    });
-
-    it('should return false when running with Bun', () => {
-      // In test environment, we're running with Bun
-      expect(process.execPath.toLowerCase()).toContain('bun');
-      expect(isBinaryBuild()).toBe(false);
-    });
-
-    it('should detect bun in path case-insensitively', () => {
-      // The function uses toLowerCase() so it should handle mixed case
-      const result = isBinaryBuild();
-      // Since we're running in Bun, should be false
-      expect(result).toBe(false);
-    });
-
-    it('should return true for non-bun executable paths', () => {
-      // Mock a binary executable path
-      Object.defineProperty(process, 'execPath', {
-        value: '/usr/local/bin/archon',
-        writable: true,
-      });
-
-      expect(isBinaryBuild()).toBe(true);
-    });
-
-    it('should return true for Windows-style binary paths', () => {
-      Object.defineProperty(process, 'execPath', {
-        value: 'C:\\Program Files\\archon\\archon.exe',
-        writable: true,
-      });
-
-      expect(isBinaryBuild()).toBe(true);
-    });
-
-    it('should return false for Bun paths on different platforms', () => {
-      // macOS Homebrew
-      Object.defineProperty(process, 'execPath', {
-        value: '/opt/homebrew/bin/bun',
-        writable: true,
-      });
-      expect(isBinaryBuild()).toBe(false);
-
-      // Linux
-      Object.defineProperty(process, 'execPath', {
-        value: '/home/user/.bun/bin/bun',
-        writable: true,
-      });
-      expect(isBinaryBuild()).toBe(false);
-
-      // Windows
-      Object.defineProperty(process, 'execPath', {
-        value: 'C:\\Users\\user\\.bun\\bin\\bun.exe',
-        writable: true,
-      });
+    it('should return false when running in test environment (not compiled)', () => {
+      // The true path requires an actual compiled binary (import.meta.dir points to
+      // Bun's virtual FS only inside compiled binaries). Coverage of the true branch
+      // relies on isBunVirtualFs tests above + manual binary smoke testing in CI.
       expect(isBinaryBuild()).toBe(false);
     });
   });
@@ -138,22 +107,24 @@ describe('bundled-defaults', () => {
       const expectedWorkflows = [
         'archon-assist',
         'archon-comprehensive-pr-review',
+        'archon-create-issue',
         'archon-feature-development',
         'archon-fix-github-issue',
-        'archon-ralph-fresh',
-        'archon-ralph-stateful',
         'archon-resolve-conflicts',
         'archon-smart-pr-review',
-        'archon-test-loop',
         'archon-validate-pr',
         'archon-remotion-generate',
+        'archon-interactive-prd',
+        'archon-piv-loop',
+        'archon-adversarial-dev',
+        'archon-workflow-builder',
       ];
 
       for (const wf of expectedWorkflows) {
         expect(BUNDLED_WORKFLOWS).toHaveProperty(wf);
       }
 
-      expect(Object.keys(BUNDLED_WORKFLOWS)).toHaveLength(11);
+      expect(Object.keys(BUNDLED_WORKFLOWS)).toHaveLength(13);
     });
 
     it('should have non-empty content for all workflows', () => {
@@ -166,6 +137,15 @@ describe('bundled-defaults', () => {
       }
     });
 
+    it('archon-workflow-builder should have validate-before-save node ordering and key constraints', () => {
+      const content = BUNDLED_WORKFLOWS['archon-workflow-builder'];
+      expect(content).toContain('id: validate-yaml');
+      expect(content).toContain('depends_on: [validate-yaml]');
+      expect(content).toContain('denied_tools: [Edit, Bash]');
+      expect(content).toContain('output_format:');
+      expect(content).toContain('workflow_name');
+    });
+
     it('should have valid YAML structure', () => {
       // Workflows are YAML files, should parse without error
       for (const [name, content] of Object.entries(BUNDLED_WORKFLOWS)) {
@@ -173,11 +153,9 @@ describe('bundled-defaults', () => {
         expect(content).toContain('name:');
         // Should contain 'description:' as all workflows require description
         expect(content).toContain('description:');
-        // Should contain steps:, loop:, or nodes: (the three workflow execution modes)
-        const hasSteps = content.includes('steps:');
-        const hasLoop = content.includes('loop:');
+        // Should contain nodes: (with optional loop: inside nodes)
         const hasNodes = content.includes('nodes:');
-        expect(hasSteps || hasLoop || hasNodes).toBe(true);
+        expect(hasNodes).toBe(true);
       }
     });
   });

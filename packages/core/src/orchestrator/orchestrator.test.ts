@@ -1,9 +1,10 @@
 import { mock, describe, test, expect, beforeEach } from 'bun:test';
 import { MockPlatformAdapter } from '../test/mocks/platform';
 import { createMockLogger } from '../test/mocks/logger';
+import { makeTestWorkflow, makeTestWorkflowList } from '@archon/workflows/test-utils';
 import type { Conversation, Codebase, Session } from '../types';
 import { ConversationNotFoundError } from '../types';
-import type { WorkflowDefinition } from '@archon/workflows';
+import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 
 // ─── Mock setup (BEFORE importing module under test) ─────────────────────────
 
@@ -156,10 +157,16 @@ mock.module('../utils/error-formatter', () => ({
   classifyAndFormatError: mock((err: Error) => `⚠️ Error: ${err.message}`),
 }));
 
-mock.module('@archon/workflows', () => ({
+mock.module('@archon/workflows/workflow-discovery', () => ({
   discoverWorkflowsWithConfig: mockDiscoverWorkflows,
+}));
+mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mockExecuteWorkflow,
+}));
+mock.module('@archon/workflows/router', () => ({
   findWorkflow: mockFindWorkflow,
+}));
+mock.module('@archon/workflows/utils/tool-formatter', () => ({
   formatToolCall: mock((toolName: string, _toolInput: unknown) => `🔧 ${toolName.toUpperCase()}`),
 }));
 
@@ -229,23 +236,11 @@ const mockSession: Session = {
   ended_reason: null,
 };
 
-const testWorkflows: WorkflowDefinition[] = [
-  {
-    name: 'fix-bug',
-    description: 'Fix a bug',
-    steps: [{ command: 'investigate' }, { command: 'implement' }],
-  },
-  {
-    name: 'add-feature',
-    description: 'Add a feature',
-    steps: [{ command: 'plan' }, { command: 'implement' }],
-  },
-  {
-    name: 'archon-assist',
-    description: 'General assistance',
-    steps: [{ command: 'assist' }],
-  },
-];
+const testWorkflowDefs = makeTestWorkflowList(['fix-bug', 'add-feature', 'archon-assist']);
+const testWorkflows = testWorkflowDefs.map(w => ({
+  workflow: w,
+  source: 'bundled' as const,
+}));
 
 const mockClient = {
   sendQuery: mock(async function* () {
@@ -298,7 +293,7 @@ function clearAllMocks(): void {
 
 describe('parseOrchestratorCommands', () => {
   const codebases: Codebase[] = [mockCodebase];
-  const workflows: WorkflowDefinition[] = testWorkflows;
+  const workflows: WorkflowDefinition[] = testWorkflowDefs;
 
   test('parses /invoke-workflow with --project', () => {
     const response = 'I will fix this.\n/invoke-workflow fix-bug --project test-project';
@@ -513,11 +508,10 @@ describe('orchestrator-agent handleMessage', () => {
     });
 
     test('uses CommandResult workflow definition without rediscovery for /workflow run', async () => {
-      const workflowDefinition: WorkflowDefinition = {
+      const workflowDefinition = makeTestWorkflow({
         name: 'test-workflow',
         description: 'A test workflow',
-        steps: [{ command: 'assist' }],
-      };
+      });
       mockGetOrCreateConversation.mockResolvedValue(mockConversationWithProject);
       mockGetCodebase.mockResolvedValue(mockCodebase);
       mockHandleCommand.mockResolvedValue({
@@ -537,11 +531,10 @@ describe('orchestrator-agent handleMessage', () => {
     });
 
     test('validates workflow exists in auto-selected project before dispatch', async () => {
-      const workflowDefinition: WorkflowDefinition = {
+      const workflowDefinition = makeTestWorkflow({
         name: 'test-workflow',
         description: 'A test workflow',
-        steps: [{ command: 'assist' }],
-      };
+      });
       mockListCodebases.mockResolvedValue([mockCodebase]);
       mockHandleCommand.mockResolvedValue({
         success: true,
@@ -549,7 +542,12 @@ describe('orchestrator-agent handleMessage', () => {
         workflow: { definition: workflowDefinition, args: 'payload' },
       });
       mockDiscoverWorkflows.mockResolvedValue({
-        workflows: [{ ...workflowDefinition, name: 'other-workflow' }],
+        workflows: [
+          {
+            workflow: { ...workflowDefinition, name: 'other-workflow' },
+            source: 'bundled' as const,
+          },
+        ],
         errors: [],
       });
 
@@ -681,7 +679,8 @@ describe('orchestrator-agent handleMessage', () => {
       expect(mockClient.sendQuery).toHaveBeenCalledWith(
         expect.any(String),
         expect.any(String),
-        'claude-session-xyz'
+        'claude-session-xyz',
+        expect.any(Object)
       );
     });
 
@@ -694,6 +693,75 @@ describe('orchestrator-agent handleMessage', () => {
       await handleMessage(platform, 'chat-456', 'hello');
 
       expect(mockUpdateSession).toHaveBeenCalledWith('session-abc', 'new-ai-session-456');
+    });
+  });
+
+  // ─── settingSources forwarding ────────────────────────────────────────
+
+  describe('settingSources forwarding', () => {
+    test('passes settingSources from config to AI client for claude', async () => {
+      mockLoadConfig.mockResolvedValueOnce({
+        botName: 'Archon',
+        assistant: 'claude',
+        assistants: {
+          claude: { settingSources: ['project', 'user'] },
+          codex: {},
+        },
+        streaming: { telegram: 'stream', discord: 'batch', slack: 'batch', github: 'batch' },
+        paths: { workspaces: '/tmp', worktrees: '/tmp' },
+        concurrency: { maxConversations: 10 },
+        commands: { autoLoad: true },
+        defaults: { copyDefaults: true, loadDefaultCommands: true, loadDefaultWorkflows: true },
+      });
+
+      mockClient.sendQuery.mockImplementation(async function* () {
+        yield { type: 'result', sessionId: 'session-id' };
+      });
+
+      await handleMessage(platform, 'chat-456', 'hello');
+
+      expect(mockClient.sendQuery).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
+        expect.anything(),
+        expect.objectContaining({ settingSources: ['project', 'user'] })
+      );
+    });
+
+    test('does not pass settingSources for non-claude assistant', async () => {
+      const codexConversation: Conversation = {
+        ...mockConversation,
+        ai_assistant_type: 'codex',
+      };
+      mockGetOrCreateConversation.mockResolvedValueOnce(codexConversation);
+      mockLoadConfig.mockResolvedValueOnce({
+        botName: 'Archon',
+        assistant: 'codex',
+        assistants: {
+          claude: { settingSources: ['project', 'user'] },
+          codex: {},
+        },
+        streaming: { telegram: 'stream', discord: 'batch', slack: 'batch', github: 'batch' },
+        paths: { workspaces: '/tmp', worktrees: '/tmp' },
+        concurrency: { maxConversations: 10 },
+        commands: { autoLoad: true },
+        defaults: { copyDefaults: true, loadDefaultCommands: true, loadDefaultWorkflows: true },
+      });
+
+      const codexClient = {
+        sendQuery: mock(async function* () {
+          yield { type: 'result', sessionId: 'codex-session' };
+        }),
+      };
+      mockGetAssistantClient.mockReturnValueOnce(codexClient);
+
+      await handleMessage(platform, 'chat-456', 'hello');
+
+      // settingSources should NOT be in requestOptions since assistant type is codex
+      const callArgs = codexClient.sendQuery.mock.calls[0];
+      const requestOptions = callArgs?.[3] as Record<string, unknown> | undefined;
+      expect(requestOptions).toBeDefined();
+      expect(requestOptions).not.toHaveProperty('settingSources');
     });
   });
 

@@ -1,6 +1,6 @@
 /**
  * Remote Coding Agent - Main Entry Point
- * Multi-platform AI coding assistant (Telegram, Discord, Slack, GitHub)
+ * Multi-platform AI coding assistant (Telegram, Discord, Slack, GitHub, Gitea)
  */
 
 // Load environment variables FIRST — resolve to monorepo root .env
@@ -31,8 +31,16 @@ if (existsSync(globalEnvPath)) {
   }
 }
 
-import { Hono } from 'hono';
-import { TelegramAdapter, GitHubAdapter, DiscordAdapter, SlackAdapter } from '@archon/adapters';
+import { OpenAPIHono } from '@hono/zod-openapi';
+import { validationErrorHook } from './routes/openapi-defaults';
+import {
+  TelegramAdapter,
+  GitHubAdapter,
+  GitLabAdapter,
+  DiscordAdapter,
+  SlackAdapter,
+} from '@archon/adapters';
+import { GiteaAdapter } from '@archon/adapters/community/forge/gitea';
 import { WebAdapter } from './adapters/web';
 import { MessagePersistence } from './adapters/web/persistence';
 import { SSETransport } from './adapters/web/transport';
@@ -48,8 +56,8 @@ import {
   loadConfig,
   logConfig,
   getPort,
+  createWorkflowStore,
 } from '@archon/core';
-import { failStaleWorkflowRuns } from '@archon/core/db/workflows';
 import type { IPlatformAdapter } from '@archon/core';
 import { createLogger, logArchonPaths, validateAppDefaultsPaths } from '@archon/paths';
 
@@ -78,6 +86,29 @@ function createMessageErrorHandler(
       getLog().error({ err: sendError, platform, conversationId }, 'error_message_send_failed');
     }
   };
+}
+
+/**
+ * Handles unhandled promise rejections from the process.
+ *
+ * Exported for testability. Filters specifically for SDK cleanup races
+ * ("Operation aborted" when the PostToolUse hook writes to a closed pipe after
+ * a DAG node abort). Those are logged at error level but do not exit the process.
+ * All other unhandled rejections are unexpected bugs — they are logged at fatal
+ * level and the process exits immediately (Fail Fast principle).
+ */
+export function handleUnhandledRejection(reason: unknown): void {
+  const message = (reason instanceof Error ? reason.message : String(reason)).toLowerCase();
+  // SDK cleanup race: PostToolUse hook writes to a closed pipe after a DAG node
+  // abort. Safe to absorb — these are transient artifacts, not application bugs.
+  if (message.includes('operation aborted')) {
+    getLog().error({ reason }, 'unhandled_rejection.sdk_cleanup_race');
+    return;
+  }
+  // All other unhandled rejections are unexpected — crash loudly so they are
+  // not silently swallowed (CLAUDE.md: "Fail Fast + Explicit Errors").
+  getLog().fatal({ reason }, 'unhandled_rejection.fatal');
+  process.exit(1);
 }
 
 async function main(): Promise<void> {
@@ -141,10 +172,12 @@ async function main(): Promise<void> {
   // Start cleanup scheduler
   startCleanupScheduler();
 
-  // Clean up workflow runs orphaned by previous process termination
-  void failStaleWorkflowRuns().catch(err => {
-    getLog().error({ err }, 'stale_workflow_cleanup_failed');
-  });
+  // Mark workflow runs orphaned by previous process termination as failed
+  void createWorkflowStore()
+    .failOrphanedRuns()
+    .catch(err => {
+      getLog().error({ err }, 'workflow.fail_orphans_failed');
+    });
 
   // Log Archon paths configuration
   logArchonPaths();
@@ -186,8 +219,12 @@ async function main(): Promise<void> {
   const hasTelegram = Boolean(process.env.TELEGRAM_BOT_TOKEN);
   const hasDiscord = Boolean(process.env.DISCORD_BOT_TOKEN);
   const hasGitHub = Boolean(process.env.GITHUB_TOKEN && process.env.WEBHOOK_SECRET);
+  const hasGitea = Boolean(
+    process.env.GITEA_URL && process.env.GITEA_TOKEN && process.env.GITEA_WEBHOOK_SECRET
+  );
+  const hasGitLab = Boolean(process.env.GITLAB_TOKEN && process.env.GITLAB_WEBHOOK_SECRET);
 
-  if (!hasTelegram && !hasDiscord && !hasGitHub) {
+  if (!hasTelegram && !hasDiscord && !hasGitHub && !hasGitea && !hasGitLab) {
     getLog().warn('no_platform_adapters_configured');
   }
 
@@ -205,6 +242,40 @@ async function main(): Promise<void> {
     await github.start();
   } else {
     getLog().info('github_adapter_skipped');
+  }
+
+  // Initialize Gitea adapter (conditional)
+  let gitea: GiteaAdapter | null = null;
+  if (process.env.GITEA_URL && process.env.GITEA_TOKEN && process.env.GITEA_WEBHOOK_SECRET) {
+    const giteaBotMention =
+      process.env.GITEA_BOT_MENTION || process.env.BOT_DISPLAY_NAME || config.botName;
+    gitea = new GiteaAdapter(
+      process.env.GITEA_URL,
+      process.env.GITEA_TOKEN,
+      process.env.GITEA_WEBHOOK_SECRET,
+      lockManager,
+      giteaBotMention
+    );
+    await gitea.start();
+  } else {
+    getLog().info('gitea_adapter_skipped');
+  }
+
+  // Initialize GitLab adapter (conditional)
+  let gitlab: GitLabAdapter | null = null;
+  if (process.env.GITLAB_TOKEN && process.env.GITLAB_WEBHOOK_SECRET) {
+    const gitlabBotMention =
+      process.env.GITLAB_BOT_MENTION || process.env.BOT_DISPLAY_NAME || config.botName;
+    gitlab = new GitLabAdapter(
+      process.env.GITLAB_TOKEN,
+      process.env.GITLAB_WEBHOOK_SECRET,
+      lockManager,
+      process.env.GITLAB_URL || undefined,
+      gitlabBotMention
+    );
+    await gitlab.start();
+  } else {
+    getLog().info('gitlab_adapter_skipped');
   }
 
   // Initialize Discord adapter (conditional)
@@ -325,7 +396,7 @@ async function main(): Promise<void> {
   }
 
   // Setup Hono server
-  const app = new Hono();
+  const app = new OpenAPIHono({ defaultHook: validationErrorHook });
   const port = await getPort();
 
   // Global error handler for unhandled exceptions
@@ -368,6 +439,60 @@ async function main(): Promise<void> {
     getLog().info('github_webhook_registered');
   }
 
+  // Gitea webhook endpoint
+  if (gitea) {
+    app.post('/webhooks/gitea', async c => {
+      const eventType = c.req.header('x-gitea-event');
+
+      try {
+        const signature = c.req.header('x-gitea-signature');
+        if (!signature) {
+          return c.json({ error: 'Missing signature header' }, 400);
+        }
+
+        // CRITICAL: Use c.req.text() for raw body (signature verification)
+        const payload = await c.req.text();
+
+        // Process async (fire-and-forget for fast webhook response)
+        gitea.handleWebhook(payload, signature).catch((error: unknown) => {
+          getLog().error({ err: error, eventType }, 'gitea_webhook_processing_error');
+        });
+
+        return c.text('OK', 200);
+      } catch (error) {
+        getLog().error({ err: error, eventType }, 'gitea_webhook_endpoint_error');
+        return c.json({ error: 'Internal server error' }, 500);
+      }
+    });
+    getLog().info('gitea_webhook_registered');
+  }
+
+  // GitLab webhook endpoint
+  if (gitlab) {
+    app.post('/webhooks/gitlab', async c => {
+      const eventType = c.req.header('x-gitlab-event');
+
+      try {
+        const token = c.req.header('x-gitlab-token');
+        if (!token) {
+          return c.json({ error: 'Missing token header' }, 400);
+        }
+
+        const payload = await c.req.text();
+
+        gitlab.handleWebhook(payload, token).catch((error: unknown) => {
+          getLog().error({ err: error, eventType }, 'gitlab.webhook_processing_error');
+        });
+
+        return c.text('OK', 200);
+      } catch (error) {
+        getLog().error({ err: error, eventType }, 'gitlab.webhook_endpoint_error');
+        return c.json({ error: 'Internal server error' }, 500);
+      }
+    });
+    getLog().info('gitlab_webhook_registered');
+  }
+
   // Health check endpoints
   app.get('/health', c => {
     return c.json({ status: 'ok' });
@@ -384,8 +509,8 @@ async function main(): Promise<void> {
   });
 
   app.get('/health/concurrency', c => {
-    const stats = lockManager.getStats();
-    return c.json({ status: 'ok', ...stats });
+    const { active, queuedTotal, maxConcurrent } = lockManager.getStats();
+    return c.json({ status: 'ok', active, queuedTotal, maxConcurrent });
   });
 
   // Serve web UI static files in production
@@ -404,12 +529,14 @@ async function main(): Promise<void> {
     app.get('*', serveStatic({ root: webDistPath, path: 'index.html' }));
   }
 
+  const hostname = process.env.HOST || '0.0.0.0';
   const server = Bun.serve({
     fetch: app.fetch,
+    hostname,
     port,
     idleTimeout: 255, // Max value (seconds) - prevents SSE connections from being killed
   });
-  getLog().info({ port: server.port }, 'server_listening');
+  getLog().info({ port: server.port, hostname }, 'server_listening');
 
   // Initialize Telegram adapter (conditional)
   let telegram: TelegramAdapter | null = null;
@@ -453,6 +580,8 @@ async function main(): Promise<void> {
           telegram?.stop();
           discord?.stop();
           slack?.stop();
+          gitea?.stop();
+          gitlab?.stop();
           await webAdapter.stop();
         } catch (error) {
           getLog().error({ err: error }, 'adapter_stop_error');
@@ -473,14 +602,47 @@ async function main(): Promise<void> {
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
 
+  // Guard against SDK cleanup races: when a DAG node is aborted mid-execution,
+  // the Claude Agent SDK's PostToolUse hook may be in-flight. After the hook
+  // returns { continue: true }, handleControlRequest() tries to write() back to
+  // the subprocess pipe — but the pipe is already closed (abort fired). The
+  // write() throws "Operation aborted", which becomes an unhandled rejection
+  // because it occurs AFTER the for-await generator loop exits (and thus outside
+  // the try/catch in claude.ts). These are SDK cleanup races, not fatal app errors.
+  process.on('unhandledRejection', handleUnhandledRejection);
+
   // Show active platforms
   const activePlatforms = ['Web'];
   if (telegram) activePlatforms.push('Telegram');
   if (discord) activePlatforms.push('Discord');
   if (slack) activePlatforms.push('Slack');
   if (github) activePlatforms.push('GitHub');
+  if (gitea) activePlatforms.push('Gitea');
+  if (gitlab) activePlatforms.push('GitLab');
 
   getLog().info({ activePlatforms, port }, 'server_ready');
+
+  // Non-blocking: warn at startup if gh CLI auth is unavailable
+  checkGhAuth().catch((err: unknown) => {
+    getLog().debug({ err }, 'gh_auth.check_unexpected_error');
+  });
+}
+
+/**
+ * Run `gh auth status` and warn if it fails.
+ * Helps diagnose expired tokens or missing auth before workflows fail.
+ */
+async function checkGhAuth(): Promise<void> {
+  const { execFileAsync } = await import('@archon/git');
+  try {
+    await execFileAsync('gh', ['auth', 'status'], { timeout: 10_000 });
+    getLog().info('gh_auth.status_ok');
+  } catch {
+    getLog().warn(
+      'gh_auth.status_failed — gh CLI is not authenticated. Workflows using gh commands may fail. ' +
+        'Run `gh auth login` or set GH_TOKEN in .env to fix this.'
+    );
+  }
 }
 
 // Run the application

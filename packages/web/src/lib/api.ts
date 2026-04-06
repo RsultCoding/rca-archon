@@ -4,7 +4,10 @@
  * SSE streams bypass the proxy in dev mode (Vite proxy buffers SSE responses).
  */
 import type { WorkflowRunStatus } from '@/lib/types';
-import type { WorkflowDefinition } from '@archon/workflows/types';
+import type { components } from '@/lib/api.generated';
+
+export type WorkflowDefinition = components['schemas']['WorkflowDefinition'];
+export type DagNode = components['schemas']['DagNode'];
 
 /**
  * Base URL for SSE streams. In dev, bypasses Vite proxy by connecting directly
@@ -49,6 +52,8 @@ export interface HealthResponse {
     maxConcurrent: number;
   };
   runningWorkflows: number;
+  version?: string;
+  is_docker: boolean;
 }
 
 async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
@@ -73,12 +78,17 @@ export async function listConversations(codebaseId?: string): Promise<Conversati
 }
 
 export async function createConversation(
-  codebaseId?: string
-): Promise<{ conversationId: string; id: string }> {
+  codebaseId?: string,
+  message?: string
+): Promise<{ conversationId: string; id: string; dispatched?: boolean }> {
+  const body: Record<string, string> = {};
+  if (codebaseId) body.codebaseId = codebaseId;
+  if (message) body.message = message;
+
   return fetchJSON('/api/conversations', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ codebaseId }),
+    body: JSON.stringify(body),
   });
 }
 
@@ -99,13 +109,26 @@ export async function deleteConversation(id: string): Promise<{ success: boolean
 
 export async function sendMessage(
   conversationId: string,
-  message: string
+  message: string,
+  files?: File[]
 ): Promise<{ accepted: boolean; status: string }> {
-  return fetchJSON(`/api/conversations/${encodeURIComponent(conversationId)}/message`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message }),
-  });
+  const url = `/api/conversations/${encodeURIComponent(conversationId)}/message`;
+
+  if (!files || files.length === 0) {
+    return fetchJSON(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    });
+  }
+
+  const form = new FormData();
+  form.append('message', message);
+  for (const file of files) {
+    form.append('files', file, file.name);
+  }
+  // No Content-Type header — browser sets multipart/form-data with boundary automatically
+  return fetchJSON(url, { method: 'POST', body: form });
 }
 
 // Messages
@@ -147,16 +170,12 @@ export async function deleteCodebase(id: string): Promise<{ success: boolean }> 
   return fetchJSON<{ success: boolean }>(`/api/codebases/${id}`, { method: 'DELETE' });
 }
 
-// Workflows
-export type { WorkflowDefinition } from '@archon/workflows/types';
-
 export interface WorkflowRunResponse {
   id: string;
   workflow_name: string;
   conversation_id: string;
   parent_conversation_id: string | null;
   codebase_id: string | null;
-  current_step_index: number;
   status: WorkflowRunStatus;
   user_message: string;
   metadata: Record<string, unknown>;
@@ -178,9 +197,11 @@ export interface WorkflowEventResponse {
   created_at: string;
 }
 
-export async function listWorkflows(cwd?: string): Promise<WorkflowDefinition[]> {
+export type WorkflowListEntry = components['schemas']['WorkflowListEntry'];
+
+export async function listWorkflows(cwd?: string): Promise<WorkflowListEntry[]> {
   const params = cwd ? `?cwd=${encodeURIComponent(cwd)}` : '';
-  const result = await fetchJSON<{ workflows: WorkflowDefinition[] }>(`/api/workflows${params}`);
+  const result = await fetchJSON<{ workflows: WorkflowListEntry[] }>(`/api/workflows${params}`);
   return result.workflows;
 }
 
@@ -206,6 +227,12 @@ export interface DashboardRunResponse extends Omit<
   platform_type: string | null;
   worker_platform_id: string | null;
   parent_platform_id: string | null;
+  current_step_name: string | null;
+  total_steps: number | null;
+  current_step_status: 'running' | 'completed' | 'failed' | null;
+  agents_completed: number | null;
+  agents_failed: number | null;
+  agents_total: number | null;
 }
 
 /** Status counts across all matching runs (ignoring status filter). */
@@ -216,6 +243,7 @@ export interface DashboardCounts {
   failed: number;
   cancelled: number;
   pending: number;
+  paused: number;
 }
 
 /** Paginated dashboard runs response. */
@@ -251,6 +279,52 @@ export async function cancelWorkflowRun(
 ): Promise<{ success: boolean; message: string }> {
   return fetchJSON(`/api/workflows/runs/${encodeURIComponent(runId)}/cancel`, {
     method: 'POST',
+  });
+}
+
+export async function resumeWorkflowRun(
+  runId: string
+): Promise<{ success: boolean; message: string }> {
+  return fetchJSON(`/api/workflows/runs/${encodeURIComponent(runId)}/resume`, {
+    method: 'POST',
+  });
+}
+
+export async function abandonWorkflowRun(
+  runId: string
+): Promise<{ success: boolean; message: string }> {
+  return fetchJSON(`/api/workflows/runs/${encodeURIComponent(runId)}/abandon`, {
+    method: 'POST',
+  });
+}
+
+export async function deleteWorkflowRun(
+  runId: string
+): Promise<{ success: boolean; message: string }> {
+  return fetchJSON(`/api/workflows/runs/${encodeURIComponent(runId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function approveWorkflowRun(
+  runId: string,
+  comment?: string
+): Promise<{ success: boolean; message: string }> {
+  return fetchJSON(`/api/workflows/runs/${encodeURIComponent(runId)}/approve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ comment }),
+  });
+}
+
+export async function rejectWorkflowRun(
+  runId: string,
+  reason?: string
+): Promise<{ success: boolean; message: string }> {
+  return fetchJSON(`/api/workflows/runs/${encodeURIComponent(runId)}/reject`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reason }),
   });
 }
 
@@ -292,7 +366,7 @@ export async function getWorkflowRunByWorker(
   }
 }
 
-export type WorkflowSource = 'project' | 'bundled';
+export type WorkflowSource = components['schemas']['WorkflowSource'];
 
 export interface GetWorkflowResponse {
   workflow: WorkflowDefinition;
@@ -349,8 +423,60 @@ export async function listCommands(cwd?: string): Promise<CommandEntry[]> {
   return result.commands;
 }
 
-export async function getConfig(): Promise<{ config: Record<string, unknown>; database: string }> {
+export type SafeConfigResponse = components['schemas']['SafeConfig'];
+
+export async function getConfig(): Promise<{ config: SafeConfigResponse; database: string }> {
   return fetchJSON('/api/config');
+}
+
+export type UpdateAssistantConfigBody = components['schemas']['UpdateAssistantConfigBody'];
+
+export async function updateAssistantConfig(
+  body: UpdateAssistantConfigBody
+): Promise<{ config: SafeConfigResponse; database: string }> {
+  return fetchJSON('/api/config/assistants', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export type IsolationEnvironment = components['schemas']['IsolationEnvironment'];
+
+export async function getCodebaseEnvironments(codebaseId: string): Promise<IsolationEnvironment[]> {
+  const result = await fetchJSON<{ environments: IsolationEnvironment[] }>(
+    `/api/codebases/${encodeURIComponent(codebaseId)}/environments`
+  );
+  return result.environments;
+}
+
+// Codebase env vars
+export async function getCodebaseEnvVars(codebaseId: string): Promise<string[]> {
+  const result = await fetchJSON<{ keys: string[] }>(
+    `/api/codebases/${encodeURIComponent(codebaseId)}/env`
+  );
+  return result.keys;
+}
+
+export async function setCodebaseEnvVar(
+  codebaseId: string,
+  data: { key: string; value: string }
+): Promise<{ success: boolean }> {
+  return fetchJSON<{ success: boolean }>(`/api/codebases/${encodeURIComponent(codebaseId)}/env`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+}
+
+export async function deleteCodebaseEnvVar(
+  codebaseId: string,
+  key: string
+): Promise<{ success: boolean }> {
+  return fetchJSON<{ success: boolean }>(
+    `/api/codebases/${encodeURIComponent(codebaseId)}/env/${encodeURIComponent(key)}`,
+    { method: 'DELETE' }
+  );
 }
 
 // System

@@ -185,7 +185,15 @@ const AUTH_PATTERNS = [
 ];
 
 /** Patterns indicating the subprocess crashed (transient, worth retrying) */
-const SUBPROCESS_CRASH_PATTERNS = ['exited with code', 'killed', 'signal'];
+const SUBPROCESS_CRASH_PATTERNS = [
+  'exited with code',
+  'killed',
+  'signal',
+  // "Operation aborted" can appear when the SDK's PostToolUse hook tries to write()
+  // back to a subprocess pipe that was closed by an abort signal. This is a race
+  // condition in SDK cleanup — safe to classify as a crash and retry.
+  'operation aborted',
+];
 
 function classifySubprocessError(
   errorMessage: string,
@@ -199,6 +207,14 @@ function classifySubprocessError(
 }
 
 /**
+ * Returns the current process UID, or undefined on platforms that don't support it (e.g. Windows).
+ * Exported for testing — spyOn(claudeModule, 'getProcessUid') works cross-platform.
+ */
+export function getProcessUid(): number | undefined {
+  return typeof process.getuid === 'function' ? process.getuid() : undefined;
+}
+
+/**
  * Claude AI assistant client
  * Implements generic IAssistantClient interface
  */
@@ -206,11 +222,12 @@ export class ClaudeClient implements IAssistantClient {
   constructor() {
     // Claude Code SDK silently rejects bypassPermissions when running as root (UID 0).
     // Check once at construction time so the error surfaces early, not on first query.
-    // process.getuid is undefined on Windows, so optional chaining is required.
-    if (process.getuid?.() === 0) {
+    // IS_SANDBOX=1 bypasses this check — the SDK itself honours this env var in sandboxed
+    // environments (Docker, VPS, CI) where running as root is expected.
+    if (getProcessUid() === 0 && process.env.IS_SANDBOX !== '1') {
       throw new Error(
         'Claude Code SDK does not support bypassPermissions when running as root (UID 0). ' +
-          'Run as a non-root user, or use the Dockerfile which creates a non-root appuser.'
+          'Run as a non-root user, set IS_SANDBOX=1, or use the Dockerfile which creates a non-root appuser.'
       );
     }
   }
@@ -255,7 +272,9 @@ export class ClaudeClient implements IAssistantClient {
 
       const options: Options = {
         cwd,
-        env: buildSubprocessEnv(),
+        env: requestOptions?.env
+          ? { ...buildSubprocessEnv(), ...requestOptions.env }
+          : buildSubprocessEnv(),
         model: requestOptions?.model,
         abortController: controller,
         ...(requestOptions?.tools !== undefined ? { tools: requestOptions.tools } : {}),
@@ -266,8 +285,7 @@ export class ClaudeClient implements IAssistantClient {
         ...(requestOptions?.outputFormat !== undefined
           ? { outputFormat: requestOptions.outputFormat }
           : {}),
-        // Pass hooks for per-node SDK hook callbacks
-        ...(requestOptions?.hooks !== undefined ? { hooks: requestOptions.hooks } : {}),
+        // Note: hooks are merged below (line with `hooks: { ... }`) — not spread here
         // Pass MCP servers for per-node MCP support (Claude Agent SDK v0.2.74+)
         ...(requestOptions?.mcpServers !== undefined
           ? { mcpServers: requestOptions.mcpServers }
@@ -285,10 +303,15 @@ export class ClaudeClient implements IAssistantClient {
         ...(requestOptions?.persistSession !== undefined
           ? { persistSession: requestOptions.persistSession }
           : {}),
+        // When forkSession is true, the SDK copies the prior session's history into a new
+        // session file, leaving the original untouched — safe to use on retries.
+        ...(requestOptions?.forkSession !== undefined
+          ? { forkSession: requestOptions.forkSession }
+          : {}),
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         systemPrompt: { type: 'preset', preset: 'claude_code' },
-        settingSources: ['project'],
+        settingSources: requestOptions?.settingSources ?? ['project'],
         // Merge user-provided hooks with our PostToolUse capture hook
         hooks: {
           ...(requestOptions?.hooks ?? {}),
@@ -344,7 +367,10 @@ export class ClaudeClient implements IAssistantClient {
 
       if (resumeSessionId) {
         options.resume = resumeSessionId;
-        getLog().debug({ sessionId: resumeSessionId }, 'resuming_session');
+        getLog().debug(
+          { sessionId: resumeSessionId, forkSession: requestOptions?.forkSession },
+          'resuming_session'
+        );
       } else {
         getLog().debug({ cwd, attempt }, 'starting_new_session');
       }
@@ -392,6 +418,8 @@ export class ClaudeClient implements IAssistantClient {
           } else if (msg.type === 'result') {
             const resultMsg = msg as {
               session_id?: string;
+              is_error?: boolean;
+              subtype?: string;
               usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number };
               structured_output?: unknown;
             };
@@ -403,6 +431,7 @@ export class ClaudeClient implements IAssistantClient {
               ...(resultMsg.structured_output !== undefined
                 ? { structuredOutput: resultMsg.structured_output }
                 : {}),
+              ...(resultMsg.is_error ? { isError: true, errorSubtype: resultMsg.subtype } : {}),
             };
           }
         }

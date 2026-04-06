@@ -23,6 +23,13 @@ interface IsolationRequestBase {
   codebaseId: string;
 
   /**
+   * Codebase name in "owner/repo" format.
+   * When present, used to resolve the project-scoped worktree path directly,
+   * even for locally-registered repos whose path doesn't start with workspacesPath.
+   */
+  codebaseName?: string;
+
+  /**
    * Absolute, resolved filesystem path to the main repository checkout.
    *
    * "Canonical" means the real path with symlinks resolved and `~` expanded
@@ -201,6 +208,9 @@ export interface IsolationHints {
   /** Start-point branch for new task worktree creation. Only consumed when workflowType === 'task'. */
   fromBranch?: BranchName;
 
+  /** Expected base branch for this workflow. When set, reused worktrees are validated with merge-base. */
+  baseBranch?: BranchName;
+
   // Cross-reference hints
   linkedIssues?: number[];
   linkedPRs?: number[];
@@ -209,7 +219,7 @@ export interface IsolationHints {
   suggestedBranch?: string;
 }
 
-export type IsolationBlockReason = 'limit_reached' | 'creation_failed';
+export type IsolationBlockReason = 'creation_failed';
 
 // --- Database Types ---
 
@@ -240,14 +250,13 @@ export type RepoConfigLoader = (repoPath: string) => Promise<WorktreeCreateConfi
 
 /**
  * Detailed worktree status breakdown for a codebase.
- * Used for limit-reached messaging.
+ * Used for status display and cleanup messaging.
  */
 export interface WorktreeStatusBreakdown {
   total: number;
   merged: number;
   stale: number;
   active: number;
-  limit: number;
   mergedEnvs: { id: string; branchName: string }[];
   staleEnvs: { id: string; branchName: string; daysInactive: number }[];
   activeEnvs: { id: string; branchName: string }[];

@@ -2,7 +2,7 @@
  * Core type definitions for the Remote Coding Agent platform
  */
 import type { TransitionTrigger } from '../state/session-transitions';
-import type { WorkflowDefinition } from '@archon/workflows';
+import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import type { McpServerConfig, AgentDefinition } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 
@@ -35,11 +35,20 @@ export interface Conversation {
 
 import type { IsolationHints } from '@archon/isolation';
 
+export interface AttachedFile {
+  /** Absolute path on disk where the file was saved by the server */
+  path: string;
+  name: string;
+  mimeType: string;
+  size: number;
+}
+
 export interface HandleMessageContext {
   readonly issueContext?: string;
   readonly threadContext?: string;
   readonly parentConversationId?: string;
   readonly isolationHints?: IsolationHints;
+  readonly attachedFiles?: AttachedFile[];
 }
 
 export interface Codebase {
@@ -187,12 +196,19 @@ export type MessageChunk =
   | { type: 'assistant'; content: string }
   | { type: 'system'; content: string }
   | { type: 'thinking'; content: string }
-  | { type: 'result'; sessionId?: string; tokens?: TokenUsage }
+  | {
+      type: 'result';
+      sessionId?: string;
+      tokens?: TokenUsage;
+      structuredOutput?: unknown;
+      isError?: boolean;
+      errorSubtype?: string;
+    }
   | { type: 'tool'; toolName: string; toolInput?: Record<string, unknown> }
   | { type: 'tool_result'; toolName: string; toolOutput: string }
   | { type: 'workflow_dispatch'; workerConversationId: string; workflowName: string };
 
-import type { ModelReasoningEffort, WebSearchMode } from '@archon/workflows';
+import type { ModelReasoningEffort, WebSearchMode } from '@archon/workflows/schemas/workflow';
 export type { ModelReasoningEffort, WebSearchMode };
 
 export interface AssistantRequestOptions {
@@ -215,8 +231,9 @@ export interface AssistantRequestOptions {
    */
   disallowedTools?: string[];
   /**
-   * Structured output schema. Claude Agent SDK enforces this via outputFormat option.
-   * Only supported by Claude — ignored by Codex (caller must not set for Codex nodes).
+   * Structured output schema.
+   * Claude: passed as outputFormat option to Claude Agent SDK.
+   * Codex: passed as outputSchema in TurnOptions to Codex SDK (v0.116.0+).
    * Shape: { type: 'json_schema', schema: <JSON Schema object> }
    */
   outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
@@ -260,6 +277,26 @@ export interface AssistantRequestOptions {
    * to avoid disk pollution. Set to true only when session persistence is explicitly needed.
    */
   persistSession?: boolean;
+  /**
+   * When true, the SDK copies the prior session's history into a new session file
+   * before appending, leaving the original untouched. Use with `resume` to safely
+   * preserve conversation context without risk of corrupting the source session.
+   * Claude only — ignored for Codex.
+   */
+  forkSession?: boolean;
+  /**
+   * Claude Code settingSources — controls which CLAUDE.md files are loaded.
+   * Passed directly to Claude Agent SDK Options.settingSources.
+   * Claude only — ignored for Codex.
+   * @default ['project']
+   */
+  settingSources?: ('project' | 'user')[];
+  /**
+   * Additional env vars merged into Claude subprocess environment after buildSubprocessEnv().
+   * Final env: { ...buildSubprocessEnv(), ...env } (auth tokens conditionally filtered).
+   * Claude only — Codex SDK does not support env injection.
+   */
+  env?: Record<string, string>;
 }
 
 /**

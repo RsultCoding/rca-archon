@@ -3,8 +3,11 @@
  * SSE event types match what the Web adapter emits.
  */
 
-import type { WorkflowRunStatus, WorkflowStepStatus, ArtifactType } from '@archon/workflows/types';
-export type { WorkflowRunStatus, WorkflowStepStatus, ArtifactType };
+import type { components } from '@/lib/api.generated';
+
+export type WorkflowRunStatus = components['schemas']['WorkflowRunStatus'];
+export type WorkflowStepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+export type ArtifactType = 'pr' | 'commit' | 'file_created' | 'file_modified' | 'branch';
 
 // Base SSE event
 interface BaseSSEEvent {
@@ -72,18 +75,6 @@ export interface HeartbeatEvent extends BaseSSEEvent {
   type: 'heartbeat';
 }
 
-// Workflow step update
-export interface WorkflowStepEvent extends BaseSSEEvent {
-  type: 'workflow_step';
-  runId: string;
-  step: number;
-  total: number;
-  name: string;
-  status: WorkflowStepStatus;
-  duration?: number;
-  iteration?: number;
-}
-
 /** SSE events only carry active run statuses — 'pending' is excluded because
  *  the server never emits a status event for a run that hasn't started yet. */
 export type ActiveWorkflowRunStatus = Exclude<WorkflowRunStatus, 'pending'>;
@@ -95,19 +86,7 @@ export interface WorkflowStatusEvent extends BaseSSEEvent {
   workflowName: string;
   status: ActiveWorkflowRunStatus;
   error?: string;
-}
-
-// Parallel agent status
-export interface ParallelAgentEvent extends BaseSSEEvent {
-  type: 'parallel_agent';
-  runId: string;
-  step: number;
-  agentIndex: number;
-  totalAgents: number;
-  name: string;
-  status: WorkflowStepStatus;
-  duration?: number;
-  error?: string;
+  approval?: { nodeId: string; message: string };
 }
 
 // DAG node status (emitted during DAG workflow execution)
@@ -120,6 +99,16 @@ export interface DagNodeEvent extends BaseSSEEvent {
   duration?: number;
   error?: string;
   reason?: 'when_condition' | 'trigger_rule';
+}
+
+// Workflow tool activity (tool_started / tool_completed from executor)
+export interface WorkflowToolActivityEvent extends BaseSSEEvent {
+  type: 'workflow_tool_activity';
+  runId: string;
+  toolName: string;
+  stepName: string;
+  status: 'started' | 'completed';
+  durationMs?: number;
 }
 
 // Workflow artifact
@@ -151,6 +140,12 @@ export interface RetractEvent extends BaseSSEEvent {
   type: 'retract';
 }
 
+// System status (e.g., workspace sync result)
+export interface SystemStatusEvent extends BaseSSEEvent {
+  type: 'system_status';
+  content: string;
+}
+
 /**
  * Discriminated union of all SSE event types emitted by the Web adapter.
  * Parsed from JSON with no runtime validation — the server is trusted.
@@ -164,14 +159,14 @@ export type SSEEvent =
   | ErrorEvent
   | WarningEvent
   | HeartbeatEvent
-  | WorkflowStepEvent
   | WorkflowStatusEvent
-  | ParallelAgentEvent
   | DagNodeEvent
+  | WorkflowToolActivityEvent
   | WorkflowArtifactEvent
   | WorkflowDispatchEvent
   | WorkflowOutputPreviewEvent
-  | RetractEvent;
+  | RetractEvent
+  | SystemStatusEvent;
 
 // UI State types
 
@@ -180,14 +175,22 @@ export type SSEEvent =
  * with persisted data (content, toolCalls). When loading from the API, display
  * fields default to their inactive states.
  */
+export interface FileAttachment {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+}
+
 export interface ChatMessage {
   id: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   content: string;
   toolCalls?: ToolCallDisplay[];
   error?: ErrorDisplay;
   timestamp: number;
   isStreaming?: boolean;
+  files?: FileAttachment[];
   workflowDispatch?: {
     workerConversationId: string;
     workflowName: string;
@@ -216,22 +219,6 @@ export interface ErrorDisplay {
 
 // Workflow UI State types
 
-export interface WorkflowStepState {
-  index: number;
-  name: string;
-  status: WorkflowStepStatus;
-  duration?: number;
-  agents?: ParallelAgentState[];
-}
-
-export interface ParallelAgentState {
-  index: number;
-  name: string;
-  status: WorkflowStepStatus;
-  duration?: number;
-  error?: string;
-}
-
 export interface DagNodeState {
   nodeId: string;
   name: string;
@@ -252,14 +239,18 @@ export interface WorkflowState {
   runId: string;
   workflowName: string;
   status: WorkflowRunStatus;
-  steps: WorkflowStepState[];
   dagNodes: DagNodeState[];
   artifacts: WorkflowArtifact[];
-  isLoop: boolean;
   currentIteration?: number;
   maxIterations?: number;
   startedAt: number;
   completedAt?: number;
   error?: string;
   stale?: boolean;
+  approval?: { nodeId: string; message: string };
+  currentTool?: {
+    name: string;
+    status: 'running' | 'completed';
+    durationMs?: number;
+  } | null;
 }

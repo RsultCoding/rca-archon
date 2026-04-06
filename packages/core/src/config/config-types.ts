@@ -19,6 +19,14 @@ export interface AssistantDefaults {
   additionalDirectories?: string[];
 }
 
+export interface ClaudeAssistantDefaults {
+  model?: string;
+  /** Claude Code settingSources — controls which CLAUDE.md files are loaded.
+   *  @default ['project']
+   *  @see https://github.com/anthropics/claude-agent-sdk */
+  settingSources?: ('project' | 'user')[];
+}
+
 export interface GlobalConfig {
   /**
    * Bot display name (shown in messages)
@@ -36,7 +44,7 @@ export interface GlobalConfig {
    * Assistant-specific defaults (model, reasoning effort, etc.)
    */
   assistants?: {
-    claude?: Pick<AssistantDefaults, 'model'>;
+    claude?: ClaudeAssistantDefaults;
     codex?: AssistantDefaults;
   };
 
@@ -94,7 +102,7 @@ export interface RepoConfig {
    * Assistant-specific defaults for this repository
    */
   assistants?: {
-    claude?: Pick<AssistantDefaults, 'model'>;
+    claude?: ClaudeAssistantDefaults;
     codex?: AssistantDefaults;
   };
 
@@ -134,6 +142,13 @@ export interface RepoConfig {
   };
 
   /**
+   * Per-project environment variables injected into Claude SDK subprocess env.
+   * Values here override process.env for workflow node execution.
+   * Sensitive — do not commit actual secrets to version-controlled repos.
+   */
+  env?: Record<string, string>;
+
+  /**
    * Default commands/workflows configuration
    */
   defaults?: {
@@ -169,7 +184,7 @@ export interface MergedConfig {
   botName: string;
   assistant: 'claude' | 'codex';
   assistants: {
-    claude: Pick<AssistantDefaults, 'model'>;
+    claude: ClaudeAssistantDefaults;
     codex: AssistantDefaults;
   };
   streaming: {
@@ -204,6 +219,12 @@ export interface MergedConfig {
    * When undefined, workflows referencing $BASE_BRANCH will fail with an error.
    */
   baseBranch?: string;
+  /**
+   * Merged per-project env vars from .archon/config.yaml env: section.
+   * DB env vars (from Web UI) are merged on top by executeWorkflow.
+   * Undefined when no env vars are configured.
+   */
+  envVars?: Record<string, string>;
 }
 
 /**
@@ -214,7 +235,7 @@ export interface SafeConfig {
   botName: string;
   assistant: 'claude' | 'codex';
   assistants: {
-    claude: Pick<AssistantDefaults, 'model'>;
+    claude: Pick<ClaudeAssistantDefaults, 'model'>;
     codex: Pick<AssistantDefaults, 'model' | 'modelReasoningEffort' | 'webSearchMode'>;
   };
   streaming: {

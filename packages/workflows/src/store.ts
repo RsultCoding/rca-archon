@@ -5,28 +5,30 @@
  * Implementations live in @archon/core (backed by the real DB);
  * the workflow engine depends only on this narrow interface.
  */
-import type { WorkflowRun, WorkflowRunStatus } from './types';
+import type { WorkflowRun, WorkflowRunStatus, ApprovalContext } from './schemas';
 
-export type WorkflowEventType =
-  | 'workflow_started'
-  | 'workflow_completed'
-  | 'workflow_failed'
-  | 'step_started'
-  | 'step_completed'
-  | 'step_failed'
-  | 'step_skipped_prior_success'
-  | 'node_started'
-  | 'node_completed'
-  | 'node_failed'
-  | 'node_skipped'
-  | 'parallel_agent_started'
-  | 'parallel_agent_completed'
-  | 'parallel_agent_failed'
-  | 'loop_iteration_started'
-  | 'loop_iteration_completed'
-  | 'loop_iteration_failed'
-  | 'tool_called'
-  | 'tool_completed';
+export const WORKFLOW_EVENT_TYPES = [
+  'workflow_started',
+  'workflow_completed',
+  'workflow_failed',
+  'node_started',
+  'node_completed',
+  'node_failed',
+  'node_skipped',
+  'node_skipped_prior_success',
+  'loop_iteration_started',
+  'loop_iteration_completed',
+  'loop_iteration_failed',
+  'tool_called',
+  'tool_completed',
+  'ralph_story_started',
+  'ralph_story_completed',
+  'approval_requested',
+  'approval_received',
+  'workflow_cancelled',
+] as const;
+
+export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];
 
 export interface IWorkflowStore {
   // Run lifecycle
@@ -40,21 +42,20 @@ export interface IWorkflowStore {
     parent_conversation_id?: string;
   }): Promise<WorkflowRun>;
   getWorkflowRun(id: string): Promise<WorkflowRun | null>;
-  getActiveWorkflowRun(conversationId: string): Promise<WorkflowRun | null>;
-  findResumableRun(
-    workflowName: string,
-    workingPath: string,
-    conversationId: string
-  ): Promise<WorkflowRun | null>;
+  getActiveWorkflowRunByPath(workingPath: string): Promise<WorkflowRun | null>;
+  findResumableRun(workflowName: string, workingPath: string): Promise<WorkflowRun | null>;
+  failOrphanedRuns(): Promise<{ count: number }>;
   resumeWorkflowRun(id: string): Promise<WorkflowRun>;
   updateWorkflowRun(
     id: string,
-    updates: Partial<Pick<WorkflowRun, 'current_step_index' | 'status' | 'metadata'>>
+    updates: Partial<Pick<WorkflowRun, 'status' | 'metadata'>>
   ): Promise<void>;
   updateWorkflowActivity(id: string): Promise<void>;
   getWorkflowRunStatus(id: string): Promise<WorkflowRunStatus | null>;
-  completeWorkflowRun(id: string): Promise<void>;
+  completeWorkflowRun(id: string, metadata?: Record<string, unknown>): Promise<void>;
   failWorkflowRun(id: string, error: string): Promise<void>;
+  pauseWorkflowRun(id: string, approvalContext: ApprovalContext): Promise<void>;
+  cancelWorkflowRun(id: string): Promise<void>;
 
   /**
    * Create a workflow event. Implementations MUST NOT throw — catch all errors
@@ -68,6 +69,19 @@ export interface IWorkflowStore {
     step_name?: string;
     data?: Record<string, unknown>;
   }): Promise<void>;
+
+  /**
+   * Return a map of nodeId → output for all node_completed events
+   * from a prior DAG workflow run. Used for DAG resume: the executor
+   * pre-populates nodeOutputs so completed nodes are skipped on re-run.
+   *
+   * Returns an empty map when no completed nodes exist.
+   * Throws on DB error — caller (executor.ts) owns the degradation policy.
+   */
+  getCompletedDagNodeOutputs(workflowRunId: string): Promise<Map<string, string>>;
+
+  // Per-codebase env vars for workflow node injection
+  getCodebaseEnvVars(codebaseId: string): Promise<Record<string, string>>;
 
   // Codebase lookup (for path resolution)
   getCodebase(id: string): Promise<{

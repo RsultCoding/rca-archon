@@ -14,10 +14,29 @@
 
 import { mock, describe, test, expect, beforeEach } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
-import type { Codebase } from '../types';
-import type { WorkflowDefinition } from '@archon/workflows';
+import { makeTestWorkflow, makeTestWorkflowWithSource } from '@archon/workflows/test-utils';
+import type { Codebase, Conversation, IPlatformAdapter } from '../types';
+import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 
 // ─── Mock setup (ALL mocks must come before the module under test import) ────
+
+const mockSyncWorkspace = mock(() =>
+  Promise.resolve({
+    branch: 'main',
+    synced: true,
+    previousHead: 'abc12345',
+    newHead: 'abc12345',
+    updated: false,
+  })
+);
+// Identity passthrough — strips branded type for test simplicity; empty-string guard not needed here
+const mockToRepoPath = mock((p: string) => p);
+const mockGetOrCreateConversation = mock(() => Promise.resolve(null as unknown));
+const mockGetCodebase = mock(() => Promise.resolve(null as unknown));
+const mockExecuteWorkflow = mock(() => Promise.resolve());
+const mockHandleCommand = mock(() =>
+  Promise.resolve({ success: true, message: 'ok', workflow: undefined })
+);
 
 const mockLogger = createMockLogger();
 
@@ -27,16 +46,18 @@ mock.module('@archon/paths', () => ({
   getArchonHome: mock(() => '/home/test/.archon'),
 }));
 
+const mockUpdateConversation = mock(() => Promise.resolve());
 mock.module('../db/conversations', () => ({
-  getOrCreateConversation: mock(() => Promise.resolve(null)),
+  getOrCreateConversation: mockGetOrCreateConversation,
   getConversationByPlatformId: mock(() => Promise.resolve(null)),
-  updateConversation: mock(() => Promise.resolve()),
+  updateConversation: mockUpdateConversation,
   touchConversation: mock(() => Promise.resolve()),
 }));
 
+const mockListCodebases = mock(() => Promise.resolve([] as unknown[]));
 mock.module('../db/codebases', () => ({
-  getCodebase: mock(() => Promise.resolve(null)),
-  listCodebases: mock(() => Promise.resolve([])),
+  getCodebase: mockGetCodebase,
+  listCodebases: mockListCodebases,
   createCodebase: mock(() => Promise.resolve({ id: 'new-codebase-id' })),
 }));
 
@@ -46,18 +67,30 @@ mock.module('../db/sessions', () => ({
   transitionSession: mock(() => Promise.resolve({ id: 'session-1', assistant_session_id: null })),
 }));
 
+const mockParseCommand = mock(
+  () => ({ command: 'help', args: [] }) as { command: string; args: string[] } | null
+);
 mock.module('../handlers/command-handler', () => ({
-  parseCommand: mock(() => ({ command: 'help', args: [] })),
-  handleCommand: mock(() => Promise.resolve({ success: true, message: 'ok', workflow: undefined })),
+  parseCommand: mockParseCommand,
+  handleCommand: mockHandleCommand,
 }));
 
-mock.module('@archon/workflows', () => ({
+mock.module('@archon/workflows/utils/tool-formatter', () => ({
   formatToolCall: mock((toolName: string) => `🔧 ${toolName}`),
-  discoverWorkflowsWithConfig: mock(() => Promise.resolve({ workflows: [], errors: [] })),
+}));
+const mockDiscoverWorkflowsWithConfig = mock(() =>
+  Promise.resolve({ workflows: [] as Array<{ workflow: WorkflowDefinition }>, errors: [] })
+);
+mock.module('@archon/workflows/workflow-discovery', () => ({
+  discoverWorkflowsWithConfig: mockDiscoverWorkflowsWithConfig,
+}));
+mock.module('@archon/workflows/router', () => ({
   findWorkflow: mock((name: string, workflows: WorkflowDefinition[]) =>
     workflows.find(w => w.name === name)
   ),
-  executeWorkflow: mock(() => Promise.resolve()),
+}));
+mock.module('@archon/workflows/executor', () => ({
+  executeWorkflow: mockExecuteWorkflow,
 }));
 
 mock.module('../clients/factory', () => ({
@@ -79,6 +112,19 @@ mock.module('../workflows/store-adapter', () => ({
   createWorkflowDeps: mock(() => ({})),
 }));
 
+const mockGetPausedWorkflowRun = mock(() => Promise.resolve(null as unknown));
+const mockFindResumableRunByParentConversation = mock(() => Promise.resolve(null as unknown));
+mock.module('../db/workflows', () => ({
+  getPausedWorkflowRun: mockGetPausedWorkflowRun,
+  findResumableRunByParentConversation: mockFindResumableRunByParentConversation,
+  updateWorkflowRun: mock(() => Promise.resolve()),
+}));
+
+const mockCreateWorkflowEvent = mock(() => Promise.resolve());
+mock.module('../db/workflow-events', () => ({
+  createWorkflowEvent: mockCreateWorkflowEvent,
+}));
+
 mock.module('../config/config-loader', () => ({
   loadConfig: mock(() => Promise.resolve({})),
 }));
@@ -87,9 +133,10 @@ mock.module('../services/title-generator', () => ({
   generateAndSetTitle: mock(() => Promise.resolve()),
 }));
 
+const mockDispatchBackgroundWorkflow = mock(() => Promise.resolve());
 mock.module('./orchestrator', () => ({
   validateAndResolveIsolation: mock(() => Promise.resolve({ cwd: '/test/cwd' })),
-  dispatchBackgroundWorkflow: mock(() => Promise.resolve()),
+  dispatchBackgroundWorkflow: mockDispatchBackgroundWorkflow,
 }));
 
 mock.module('./prompt-builder', () => ({
@@ -112,23 +159,20 @@ mock.module('../utils/worktree-sync', () => ({
   syncArchonToWorktree: mock(() => Promise.resolve()),
 }));
 
+mock.module('@archon/git', () => ({
+  syncWorkspace: mockSyncWorkspace,
+  toRepoPath: mockToRepoPath,
+}));
+
 mock.module('fs', () => ({
   existsSync: mock(() => true),
 }));
 
 // ─── Import module under test (AFTER all mocks) ───────────────────────────────
 
-import { parseOrchestratorCommands } from './orchestrator-agent';
+import { parseOrchestratorCommands, handleMessage } from './orchestrator-agent';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function makeWorkflow(name: string): WorkflowDefinition {
-  return {
-    name,
-    description: `${name} workflow`,
-    steps: [{ prompt: 'do the thing' }],
-  } as unknown as WorkflowDefinition;
-}
 
 function makeCodebase(name: string, id = `id-${name}`): Codebase {
   return {
@@ -146,12 +190,12 @@ function makeCodebase(name: string, id = `id-${name}`): Codebase {
 // ─── parseOrchestratorCommands ────────────────────────────────────────────────
 
 describe('parseOrchestratorCommands', () => {
-  const assistWorkflow = makeWorkflow('assist');
-  const implementWorkflow = makeWorkflow('implement');
-  const planWorkflow = makeWorkflow('plan');
+  const assistWorkflow = makeTestWorkflow({ name: 'assist' });
+  const implementWorkflow = makeTestWorkflow({ name: 'implement' });
+  const planWorkflow = makeTestWorkflow({ name: 'plan' });
 
   const myProject = makeCodebase('my-project');
-  const orgProject = makeCodebase('dynamous-community/remote-coding-agent');
+  const orgProject = makeCodebase('coleam00/Archon');
 
   const workflows = [assistWorkflow, implementWorkflow, planWorkflow];
   const codebases = [myProject, orgProject];
@@ -346,19 +390,19 @@ describe('parseOrchestratorCommands', () => {
     });
 
     test('matches project by last path segment (partial match)', () => {
-      // "dynamous-community/remote-coding-agent" matched by "remote-coding-agent"
-      const response = '/invoke-workflow assist --project remote-coding-agent';
+      // "coleam00/Archon" matched by "Archon"
+      const response = '/invoke-workflow assist --project Archon';
       const result = parseOrchestratorCommands(response, codebases, workflows);
 
       expect(result.workflowInvocation).not.toBeNull();
-      expect(result.workflowInvocation?.projectName).toBe('dynamous-community/remote-coding-agent');
+      expect(result.workflowInvocation?.projectName).toBe('coleam00/Archon');
     });
 
     test('partial match is case-insensitive', () => {
-      const response = '/invoke-workflow assist --project REMOTE-CODING-AGENT';
+      const response = '/invoke-workflow assist --project archon';
       const result = parseOrchestratorCommands(response, codebases, workflows);
 
-      expect(result.workflowInvocation?.projectName).toBe('dynamous-community/remote-coding-agent');
+      expect(result.workflowInvocation?.projectName).toBe('coleam00/Archon');
     });
 
     test('returns null workflowInvocation when project does not exist', () => {
@@ -376,11 +420,11 @@ describe('parseOrchestratorCommands', () => {
     });
 
     test('uses matched codebase name (not the input name) in result', () => {
-      // Input "remote-coding-agent" should resolve to full name "dynamous-community/remote-coding-agent"
-      const response = '/invoke-workflow assist --project remote-coding-agent';
+      // Input "Archon" should resolve to full name "coleam00/Archon"
+      const response = '/invoke-workflow assist --project Archon';
       const result = parseOrchestratorCommands(response, codebases, workflows);
 
-      expect(result.workflowInvocation?.projectName).toBe('dynamous-community/remote-coding-agent');
+      expect(result.workflowInvocation?.projectName).toBe('coleam00/Archon');
     });
   });
 
@@ -721,6 +765,51 @@ describe('filterToolIndicators logic (replicated regex tests)', () => {
   });
 });
 
+// ─── Helpers for handleMessage tests ─────────────────────────────────────────
+
+function makePlatform(): IPlatformAdapter {
+  return {
+    sendMessage: mock(() => Promise.resolve()),
+    ensureThread: mock((id: string) => Promise.resolve(id)),
+    getStreamingMode: mock(() => 'batch' as const),
+    getPlatformType: mock(() => 'web'),
+    start: mock(() => Promise.resolve()),
+    stop: mock(() => {}),
+  };
+}
+
+function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
+  return {
+    id: 'conv-1',
+    platform_type: 'web',
+    platform_conversation_id: 'conv-1',
+    codebase_id: null,
+    cwd: null,
+    isolation_env_id: null,
+    ai_assistant_type: 'claude',
+    title: 'Test Conversation',
+    hidden: false,
+    deleted_at: null,
+    last_activity_at: null,
+    created_at: new Date(),
+    updated_at: new Date(),
+    ...overrides,
+  };
+}
+
+function makeCodebaseForSync() {
+  return {
+    id: 'codebase-1',
+    name: 'test-repo',
+    repository_url: 'https://github.com/test/repo',
+    default_cwd: '/repos/test-repo',
+    ai_assistant_type: 'claude',
+    commands: {},
+    created_at: new Date(),
+    updated_at: new Date(),
+  };
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 describe('module constants (MAX_BATCH_ASSISTANT_CHUNKS, MAX_BATCH_TOTAL_CHUNKS)', () => {
@@ -742,7 +831,7 @@ describe('module constants (MAX_BATCH_ASSISTANT_CHUNKS, MAX_BATCH_TOTAL_CHUNKS)'
 describe('WorkflowInvocation and ProjectRegistration type shapes', () => {
   test('parseOrchestratorCommands result has the expected shape for workflowInvocation', () => {
     const codebases = [makeCodebase('my-project')];
-    const workflows = [makeWorkflow('assist')];
+    const workflows = [makeTestWorkflow({ name: 'assist' })];
     const response = '/invoke-workflow assist --project my-project --prompt "Do the thing"';
     const result = parseOrchestratorCommands(response, codebases, workflows);
 
@@ -766,11 +855,551 @@ describe('WorkflowInvocation and ProjectRegistration type shapes', () => {
 
   test('workflowInvocation.synthesizedPrompt is absent (not undefined-keyed) when no --prompt', () => {
     const codebases = [makeCodebase('my-project')];
-    const workflows = [makeWorkflow('assist')];
+    const workflows = [makeTestWorkflow({ name: 'assist' })];
     const response = '/invoke-workflow assist --project my-project';
     const result = parseOrchestratorCommands(response, codebases, workflows);
 
     // synthesizedPrompt is explicitly set to undefined when no prompt
     expect(result.workflowInvocation?.synthesizedPrompt).toBeUndefined();
+  });
+});
+
+// ─── discoverAllWorkflows — remote sync ───────────────────────────────────────
+
+describe('discoverAllWorkflows — remote sync', () => {
+  beforeEach(() => {
+    mockSyncWorkspace.mockClear();
+    mockToRepoPath.mockClear();
+    mockGetOrCreateConversation.mockReset();
+    mockGetCodebase.mockReset();
+    // Reset mocks between tests in this suite and restore safe defaults
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(null));
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+  });
+
+  test('calls syncWorkspace with codebase.default_cwd when conversation has codebase_id', async () => {
+    const conversation = makeConversation({ codebase_id: 'codebase-1' });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'What is the latest commit?');
+
+    // /repos/test-repo is NOT under ~/.archon/workspaces/ so resetAfterFetch=false
+    expect(mockSyncWorkspace).toHaveBeenCalledWith('/repos/test-repo', undefined, {
+      resetAfterFetch: false,
+    });
+  });
+
+  test('passes resetAfterFetch=true for managed clones', async () => {
+    const conversation = makeConversation({ codebase_id: 'codebase-1' });
+    const codebase = {
+      ...makeCodebaseForSync(),
+      default_cwd: '/home/test/.archon/workspaces/owner/repo/source',
+    };
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'What is the latest commit?');
+
+    expect(mockSyncWorkspace).toHaveBeenCalledWith(
+      '/home/test/.archon/workspaces/owner/repo/source',
+      undefined,
+      { resetAfterFetch: true }
+    );
+  });
+
+  test('proceeds without throwing when syncWorkspace rejects', async () => {
+    const conversation = makeConversation({ codebase_id: 'codebase-1' });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+    mockSyncWorkspace.mockRejectedValueOnce(new Error('Network timeout'));
+
+    const platform = makePlatform();
+    // Non-fatal: no exception propagated
+    await expect(
+      handleMessage(platform, 'conv-1', 'What is the latest commit?')
+    ).resolves.toBeUndefined();
+    expect(mockSyncWorkspace).toHaveBeenCalledWith('/repos/test-repo', undefined, {
+      resetAfterFetch: false,
+    });
+  });
+
+  test('does not call syncWorkspace when conversation has no codebase_id', async () => {
+    const conversation = makeConversation({ codebase_id: null });
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-2', 'Hello');
+
+    expect(mockSyncWorkspace).not.toHaveBeenCalled();
+  });
+
+  test('logs a warn when syncWorkspace rejects', async () => {
+    const conversation = makeConversation({ codebase_id: 'codebase-1' });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+    mockSyncWorkspace.mockRejectedValueOnce(new Error('Network timeout'));
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'What is the latest commit?');
+
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ codebaseId: 'codebase-1' }),
+      'workspace.sync_failed'
+    );
+  });
+});
+
+// ─── Workflow dispatch routing — interactive flag ─────────────────────────────
+
+describe('workflow dispatch routing — interactive flag', () => {
+  function makeDispatchConversation() {
+    return makeConversation({ codebase_id: 'codebase-1' });
+  }
+
+  function makeDispatchCodebase() {
+    return {
+      id: 'codebase-1',
+      name: 'test-repo',
+      repository_url: null,
+      default_cwd: '/repos/test-repo',
+      ai_assistant_type: 'claude' as const,
+      commands: {},
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+  }
+
+  function makeWorkflowResult(interactive?: boolean) {
+    return {
+      success: true,
+      message: 'ok',
+      workflow: {
+        definition: makeTestWorkflow({ name: 'test-workflow', interactive }),
+        args: 'test message',
+      },
+    };
+  }
+
+  beforeEach(() => {
+    mockExecuteWorkflow.mockClear();
+    mockDispatchBackgroundWorkflow.mockClear();
+    mockHandleCommand.mockReset();
+    mockHandleCommand.mockImplementation(() =>
+      Promise.resolve({ success: true, message: 'ok', workflow: undefined })
+    );
+    mockGetOrCreateConversation.mockReset();
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(null));
+    mockGetCodebase.mockReset();
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+  });
+
+  test('calls executeWorkflow (not dispatchBackground) for interactive workflow on web', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+
+    const platform = makePlatform(); // getPlatformType returns 'web'
+    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
+
+    expect(mockExecuteWorkflow).toHaveBeenCalled();
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+  });
+
+  test('calls dispatchBackgroundWorkflow for non-interactive workflow on web', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(undefined)));
+
+    const platform = makePlatform(); // getPlatformType returns 'web'
+    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
+
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+  });
+
+  test('calls executeWorkflow for interactive workflow on non-web platform', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+
+    const platform = {
+      ...makePlatform(),
+      getPlatformType: mock(() => 'slack' as const),
+    };
+    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
+
+    expect(mockExecuteWorkflow).toHaveBeenCalled();
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+  });
+});
+
+// ─── Natural-language approval routing ──────────────────────────────────────
+
+describe('natural-language approval routing', () => {
+  const approvalWorkflow = makeTestWorkflow({ name: 'prd', interactive: true });
+
+  function makePausedRun(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'run-1',
+      workflow_name: 'prd',
+      conversation_id: 'conv-1',
+      parent_conversation_id: null,
+      codebase_id: 'codebase-1',
+      status: 'paused',
+      user_message: 'original prompt',
+      metadata: { approval: { nodeId: 'gate-1', message: 'Please review' } },
+      working_path: '/repos/test-repo',
+      started_at: new Date(),
+      completed_at: null,
+      last_activity_at: null,
+      ...overrides,
+    };
+  }
+
+  function makeApprovalCodebase() {
+    return {
+      id: 'codebase-1',
+      name: 'test-repo',
+      repository_url: null,
+      default_cwd: '/repos/test-repo',
+      ai_assistant_type: 'claude' as const,
+      commands: {},
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+  }
+
+  beforeEach(() => {
+    mockGetPausedWorkflowRun.mockReset();
+    mockGetPausedWorkflowRun.mockImplementation(() => Promise.resolve(null));
+    mockCreateWorkflowEvent.mockReset();
+    mockCreateWorkflowEvent.mockImplementation(() => Promise.resolve());
+    mockGetOrCreateConversation.mockReset();
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(null));
+    mockGetCodebase.mockReset();
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+    mockExecuteWorkflow.mockClear();
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [], errors: [] })
+    );
+  });
+
+  test('natural language message with paused workflow intercepts and dispatches resume', async () => {
+    const conversation = makeConversation({ codebase_id: 'codebase-1', cwd: '/repos/test-repo' });
+    const codebase = makeApprovalCodebase();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetPausedWorkflowRun.mockReturnValueOnce(Promise.resolve(makePausedRun()));
+    // discoverAllWorkflows calls getCodebase once internally, then the NL path calls it again
+    mockGetCodebase.mockImplementation(() => Promise.resolve(codebase));
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [{ workflow: approvalWorkflow }], errors: [] })
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'looks good, proceed with implementation');
+
+    // Approval events should be written
+    expect(mockCreateWorkflowEvent).toHaveBeenCalledTimes(2);
+    // Resuming message sent
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('Resuming')
+    );
+    // Workflow should be executed
+    expect(mockExecuteWorkflow).toHaveBeenCalled();
+  });
+
+  test('slash command bypasses approval interception — getPausedWorkflowRun not called', async () => {
+    const conversation = makeConversation({ codebase_id: 'codebase-1' });
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({ success: true, message: 'status ok', workflow: undefined })
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/status');
+
+    expect(mockGetPausedWorkflowRun).not.toHaveBeenCalled();
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+  });
+
+  test('message with no paused workflow routes normally', async () => {
+    const conversation = makeConversation({ codebase_id: null });
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetPausedWorkflowRun.mockReturnValueOnce(Promise.resolve(null));
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'hello world');
+
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+    // Normal routing proceeds (no early return)
+  });
+
+  test('paused run with missing approval context sends explicit guidance', async () => {
+    const conversation = makeConversation({ codebase_id: 'codebase-1' });
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetPausedWorkflowRun.mockReturnValueOnce(Promise.resolve(makePausedRun({ metadata: {} })));
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'looks good');
+
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('approval context is missing')
+    );
+  });
+
+  test('workflow not found after approval sends error and does not dispatch', async () => {
+    const conversation = makeConversation({ codebase_id: 'codebase-1', cwd: '/repos/test-repo' });
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetPausedWorkflowRun.mockReturnValueOnce(Promise.resolve(makePausedRun()));
+    // discoverWorkflowsWithConfig returns no workflows
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [], errors: [] })
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'approve it');
+
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('not found')
+    );
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+  });
+
+  test('no codebase after approval sends error and does not dispatch', async () => {
+    const conversation = makeConversation({ codebase_id: null, cwd: '/repos/test-repo' });
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetPausedWorkflowRun.mockReturnValueOnce(Promise.resolve(makePausedRun()));
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [{ workflow: approvalWorkflow }], errors: [] })
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'approved');
+
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('no project is attached')
+    );
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+  });
+
+  test('DB failure during approval sends error message to user', async () => {
+    const conversation = makeConversation({ codebase_id: 'codebase-1', cwd: '/repos/test-repo' });
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetPausedWorkflowRun.mockReturnValueOnce(Promise.resolve(makePausedRun()));
+    // Simulate DB error when writing approval events
+    mockCreateWorkflowEvent.mockRejectedValueOnce(new Error('connection lost'));
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'go ahead');
+
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('Approval failed')
+    );
+  });
+});
+
+// ─── handleWorkflowRunCommand E2 path — single codebase auto-select ──────────
+
+describe('handleWorkflowRunCommand — E2 single codebase auto-select', () => {
+  const assistWorkflow = makeTestWorkflow({ name: 'assist' });
+
+  beforeEach(() => {
+    mockGetOrCreateConversation.mockReset();
+    mockGetCodebase.mockReset();
+    mockListCodebases.mockReset();
+    mockParseCommand.mockReset();
+    mockHandleCommand.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockUpdateConversation.mockClear();
+    mockDispatchBackgroundWorkflow.mockClear();
+    mockLogger.error.mockClear();
+
+    // Default: return empty conversation without codebase
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(null));
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+    mockListCodebases.mockImplementation(() => Promise.resolve([]));
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [], errors: [] })
+    );
+  });
+
+  test('resolves workflow from WorkflowWithSource[] by exact name match', async () => {
+    const conversation = makeConversation({ codebase_id: null });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    // parseCommand returns a /workflow run command
+    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'assist'] });
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({
+        success: true,
+        message: 'Running workflow assist...',
+        workflow: { definition: assistWorkflow, args: 'test prompt' },
+      })
+    );
+    // Single codebase triggers auto-select
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    // discoverWorkflowsWithConfig returns WorkflowWithSource[]
+    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
+      Promise.resolve({
+        workflows: [
+          makeTestWorkflowWithSource({ name: 'assist' }),
+          makeTestWorkflowWithSource({ name: 'implement' }),
+        ],
+        errors: [],
+      })
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run assist test prompt');
+
+    // Should auto-select the codebase and update conversation
+    expect(mockUpdateConversation).toHaveBeenCalledWith('conv-1', { codebase_id: codebase.id });
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
+  });
+
+  test('resolves workflow by case-insensitive name when exact match fails', async () => {
+    const upperWorkflow = makeTestWorkflow({ name: 'Assist' });
+    const conversation = makeConversation({ codebase_id: null });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'Assist'] });
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({
+        success: true,
+        message: 'Running workflow...',
+        workflow: { definition: upperWorkflow, args: 'test' },
+      })
+    );
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    // Workflow name in discovery is lowercase 'assist', but request is 'Assist'
+    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
+      Promise.resolve({
+        workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
+        errors: [],
+      })
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run Assist test');
+
+    expect(mockUpdateConversation).toHaveBeenCalledWith('conv-1', { codebase_id: codebase.id });
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
+  });
+
+  test('sends error message when workflow not found in discovery', async () => {
+    const conversation = makeConversation({ codebase_id: null });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'missing'] });
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({
+        success: true,
+        message: 'Running workflow...',
+        workflow: { definition: makeTestWorkflow({ name: 'missing' }), args: 'test' },
+      })
+    );
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
+      Promise.resolve({
+        workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
+        errors: [],
+      })
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run missing test');
+
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('not found')
+    );
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+  });
+
+  test('sends error when discovery fails', async () => {
+    const conversation = makeConversation({ codebase_id: null });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'assist'] });
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({
+        success: true,
+        message: 'Running...',
+        workflow: { definition: assistWorkflow, args: 'test' },
+      })
+    );
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    mockDiscoverWorkflowsWithConfig.mockRejectedValueOnce(new Error('YAML parse error'));
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run assist test');
+
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('Failed to load workflows')
+    );
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+  });
+});
+
+// ─── discoverAllWorkflows — merge with WorkflowWithSource ────────────────────
+
+describe('discoverAllWorkflows — merge repo workflows over global', () => {
+  beforeEach(() => {
+    mockSyncWorkspace.mockClear();
+    mockToRepoPath.mockClear();
+    mockGetOrCreateConversation.mockReset();
+    mockGetCodebase.mockReset();
+    mockListCodebases.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockDispatchBackgroundWorkflow.mockClear();
+    mockLogger.warn.mockClear();
+
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(null));
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+    mockListCodebases.mockImplementation(() => Promise.resolve([]));
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [], errors: [] })
+    );
+  });
+
+  test('repo-specific workflows override global workflows by name', async () => {
+    const conversation = makeConversation({ codebase_id: 'codebase-1' });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+
+    // First call: global discovery returns 'assist' workflow
+    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Global assist' })],
+      errors: [],
+    });
+    // Second call: repo discovery returns 'assist' with different description (override)
+    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
+      workflows: [
+        makeTestWorkflowWithSource({ name: 'assist', description: 'Repo assist' }, 'project'),
+      ],
+      errors: [],
+    });
+
+    const platform = makePlatform();
+    // Send a non-command message so it triggers discoverAllWorkflows via the orchestrator flow
+    await handleMessage(platform, 'conv-1', 'What is the latest commit?');
+
+    // discoverWorkflowsWithConfig should have been called twice (global + repo)
+    expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledTimes(2);
   });
 });

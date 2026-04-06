@@ -1,5 +1,8 @@
 import { createLogger } from '@archon/paths';
-import { getWorkflowEventEmitter, type WorkflowEmitterEvent } from '@archon/workflows';
+import {
+  getWorkflowEventEmitter,
+  type WorkflowEmitterEvent,
+} from '@archon/workflows/event-emitter';
 import { SSETransport } from './transport';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -25,61 +28,6 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
               ? 'completed'
               : 'failed',
         error: event.type === 'workflow_failed' ? event.error : undefined,
-        timestamp: Date.now(),
-      });
-
-    case 'step_started':
-      return JSON.stringify({
-        type: 'workflow_step',
-        runId: event.runId,
-        step: event.stepIndex,
-        total: event.totalSteps,
-        name: event.stepName,
-        status: 'running',
-        timestamp: Date.now(),
-      });
-
-    case 'step_completed':
-      return JSON.stringify({
-        type: 'workflow_step',
-        runId: event.runId,
-        step: event.stepIndex,
-        total: event.totalSteps,
-        name: event.stepName,
-        status: 'completed',
-        duration: event.duration,
-        timestamp: Date.now(),
-      });
-
-    case 'step_failed':
-      return JSON.stringify({
-        type: 'workflow_step',
-        runId: event.runId,
-        step: event.stepIndex,
-        total: event.totalSteps,
-        name: event.stepName,
-        status: 'failed',
-        timestamp: Date.now(),
-      });
-
-    case 'parallel_agent_started':
-    case 'parallel_agent_completed':
-    case 'parallel_agent_failed':
-      return JSON.stringify({
-        type: 'parallel_agent',
-        runId: event.runId,
-        step: event.stepIndex,
-        agentIndex: event.agentIndex,
-        totalAgents: event.type === 'parallel_agent_started' ? event.totalAgents : 0,
-        name: event.agentName,
-        status:
-          event.type === 'parallel_agent_started'
-            ? 'running'
-            : event.type === 'parallel_agent_completed'
-              ? 'completed'
-              : 'failed',
-        duration: event.type === 'parallel_agent_completed' ? event.duration : undefined,
-        error: event.type === 'parallel_agent_failed' ? event.error : undefined,
         timestamp: Date.now(),
       });
 
@@ -158,6 +106,49 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
         timestamp: Date.now(),
       });
 
+    case 'tool_started':
+      return JSON.stringify({
+        type: 'workflow_tool_activity',
+        runId: event.runId,
+        toolName: event.toolName,
+        stepName: event.stepName,
+        status: 'started',
+        timestamp: Date.now(),
+      });
+
+    case 'tool_completed':
+      return JSON.stringify({
+        type: 'workflow_tool_activity',
+        runId: event.runId,
+        toolName: event.toolName,
+        stepName: event.stepName,
+        status: 'completed',
+        durationMs: event.durationMs,
+        timestamp: Date.now(),
+      });
+
+    case 'approval_pending':
+      return JSON.stringify({
+        type: 'workflow_status',
+        runId: event.runId,
+        workflowName: '',
+        status: 'paused',
+        timestamp: Date.now(),
+        approval: {
+          nodeId: event.nodeId,
+          message: event.message,
+        },
+      });
+
+    case 'workflow_cancelled':
+      return JSON.stringify({
+        type: 'workflow_status',
+        runId: event.runId,
+        workflowName: '',
+        status: 'cancelled',
+        timestamp: Date.now(),
+      });
+
     default: {
       const exhaustiveCheck: never = event;
       getLog().warn(
@@ -192,11 +183,14 @@ export class WorkflowEventBridge {
     const emitter = getWorkflowEventEmitter();
     this.unsubscribeWorkflowEvents = emitter.subscribe((event: WorkflowEmitterEvent) => {
       const conversationId = emitter.getConversationId(event.runId);
-      if (!conversationId) return;
-
       const sseEvent = mapWorkflowEvent(event);
       if (sseEvent) {
-        this.transport.emitWorkflowEvent(conversationId, sseEvent);
+        // Emit to per-conversation stream (existing behavior)
+        if (conversationId) {
+          this.transport.emitWorkflowEvent(conversationId, sseEvent);
+        }
+        // Fan-out to dashboard stream — no-op when no dashboard client connected
+        this.transport.emitWorkflowEvent('__dashboard__', sseEvent);
       }
     });
   }
@@ -228,9 +222,7 @@ export class WorkflowEventBridge {
         // are available via REST immediately, not after the 30s periodic flush.
         if (
           this.onStepTransition &&
-          (event.type === 'step_completed' ||
-            event.type === 'step_failed' ||
-            event.type === 'loop_iteration_completed' ||
+          (event.type === 'loop_iteration_completed' ||
             event.type === 'loop_iteration_failed' ||
             event.type === 'node_completed' ||
             event.type === 'node_failed')

@@ -5,7 +5,7 @@
  * Callers in @archon/core satisfy these structurally — no adapter wrappers needed.
  */
 import type { IWorkflowStore } from './store';
-import type { ModelReasoningEffort, WebSearchMode } from './types';
+import type { ModelReasoningEffort, WebSearchMode } from './schemas';
 
 // ---------------------------------------------------------------------------
 // Workflow-local type copies — structurally identical to the originals in
@@ -25,7 +25,14 @@ export type WorkflowMessageChunk =
   | { type: 'assistant'; content: string }
   | { type: 'system'; content: string }
   | { type: 'thinking'; content: string }
-  | { type: 'result'; sessionId?: string; tokens?: WorkflowTokenUsage; structuredOutput?: unknown }
+  | {
+      type: 'result';
+      sessionId?: string;
+      tokens?: WorkflowTokenUsage;
+      structuredOutput?: unknown;
+      isError?: boolean;
+      errorSubtype?: string;
+    }
   | { type: 'tool'; toolName: string; toolInput?: Record<string, unknown> }
   | { type: 'tool_result'; toolName: string; toolOutput: string }
   | { type: 'workflow_dispatch'; workerConversationId: string; workflowName: string };
@@ -47,6 +54,12 @@ export interface WorkflowAssistantOptions {
   modelReasoningEffort?: ModelReasoningEffort;
   webSearchMode?: WebSearchMode;
   additionalDirectories?: string[];
+  /**
+   * Controls which CLAUDE.md files the SDK loads.
+   * Mirrors Claude Agent SDK Options.settingSources.
+   * Claude only — ignored for Codex.
+   */
+  settingSources?: ('project' | 'user')[];
   tools?: string[];
   disallowedTools?: string[];
   outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
@@ -109,6 +122,12 @@ export interface WorkflowAssistantOptions {
    * References a key in `agents`. Claude only.
    */
   agent?: string;
+  /**
+   * Additional env vars to merge into the Claude subprocess environment.
+   * Merged after buildSubprocessEnv() (auth tokens conditionally filtered): { ...buildSubprocessEnv(), ...env }.
+   * Claude only — ignored for Codex (Codex SDK does not expose env injection).
+   */
+  env?: Record<string, string>;
   abortSignal?: AbortSignal;
   /**
    * When false (default), skips writing session transcript to ~/.claude/projects/.
@@ -116,6 +135,13 @@ export interface WorkflowAssistantOptions {
    * to avoid disk pollution. Set to true only when session persistence is explicitly needed.
    */
   persistSession?: boolean;
+  /**
+   * When true, the SDK copies the prior session's history into a new session file
+   * before appending, leaving the original untouched. Use with `resume` to safely
+   * preserve conversation context without risk of corrupting the source session.
+   * Claude only — ignored for Codex.
+   */
+  forkSession?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -166,13 +192,22 @@ export interface WorkflowConfig {
   /** Default assistant provider ('claude' | 'codex') */
   assistant: 'claude' | 'codex';
   baseBranch?: string;
+  /**
+   * Merged per-project env vars (config file + DB). Injected into Options.env on Claude SDK calls.
+   * Populated by executeWorkflow — loadConfig returns file-based vars; DB vars merged on top after.
+   */
+  envVars?: Record<string, string>;
   commands: { folder?: string };
   defaults?: {
     loadDefaultWorkflows?: boolean;
     loadDefaultCommands?: boolean;
   };
   assistants: {
-    claude: { model?: string };
+    claude: {
+      model?: string;
+      /** Controls which CLAUDE.md files are loaded by the SDK. Claude only. */
+      settingSources?: ('project' | 'user')[];
+    };
     codex: {
       model?: string;
       modelReasoningEffort?: ModelReasoningEffort;

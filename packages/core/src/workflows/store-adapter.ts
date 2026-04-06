@@ -2,16 +2,14 @@
  * WorkflowStore adapter — bridges @archon/core DB modules to the
  * IWorkflowStore trait defined in @archon/workflows.
  */
-import type {
-  IWorkflowStore,
-  WorkflowConfig,
-  WorkflowDeps,
-  WorkflowRunStatus,
-} from '@archon/workflows';
+import type { IWorkflowStore } from '@archon/workflows/store';
+import type { WorkflowConfig, WorkflowDeps } from '@archon/workflows/deps';
+import type { WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import type { MergedConfig } from '../config/config-types';
 import * as workflowDb from '../db/workflows';
 import * as workflowEventDb from '../db/workflow-events';
 import * as codebaseDb from '../db/codebases';
+import * as envVarDb from '../db/env-vars';
 import { getAssistantClient } from '../clients/factory';
 import { loadConfig as loadMergedConfig } from '../config/config-loader';
 import { createLogger } from '@archon/paths';
@@ -31,8 +29,9 @@ export function createWorkflowStore(): IWorkflowStore {
   return {
     createWorkflowRun: workflowDb.createWorkflowRun,
     getWorkflowRun: workflowDb.getWorkflowRun,
-    getActiveWorkflowRun: workflowDb.getActiveWorkflowRun,
+    getActiveWorkflowRunByPath: workflowDb.getActiveWorkflowRunByPath,
     findResumableRun: workflowDb.findResumableRun,
+    failOrphanedRuns: workflowDb.failOrphanedRuns,
     resumeWorkflowRun: workflowDb.resumeWorkflowRun,
     updateWorkflowRun: workflowDb.updateWorkflowRun,
     updateWorkflowActivity: workflowDb.updateWorkflowActivity,
@@ -43,6 +42,8 @@ export function createWorkflowStore(): IWorkflowStore {
       workflowDb.getWorkflowRunStatus(id) as Promise<WorkflowRunStatus | null>,
     completeWorkflowRun: workflowDb.completeWorkflowRun,
     failWorkflowRun: workflowDb.failWorkflowRun,
+    pauseWorkflowRun: workflowDb.pauseWorkflowRun,
+    cancelWorkflowRun: workflowDb.cancelWorkflowRun,
     createWorkflowEvent: async (data): Promise<void> => {
       try {
         await workflowEventDb.createWorkflowEvent(data);
@@ -55,7 +56,9 @@ export function createWorkflowStore(): IWorkflowStore {
         );
       }
     },
+    getCompletedDagNodeOutputs: workflowEventDb.getCompletedDagNodeOutputs,
     getCodebase: codebaseDb.getCodebase,
+    getCodebaseEnvVars: envVarDb.getCodebaseEnvVars,
   };
 }
 

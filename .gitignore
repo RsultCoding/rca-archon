@@ -32,6 +32,10 @@ yarn-error.log*
 # Caddy configuration (keep Caddyfile.example)
 Caddyfile
 
+# User Docker customization (local only, never commit)
+Dockerfile.user
+docker-compose.override.yml
+
 # Session files
 sessions/
 api_sessions/
@@ -48,6 +52,7 @@ e2e-screenshots/
 .agents/pr-reviews
 .claude/PRPs/
 .claude/archon/
+.claude/mockups/
 .claude/settings.local.json
 e2e-testing-findings-session2.md
 
@@ -99,3 +104,4 @@ packages/server/.env
 .playwright-cli/
 skills-lock.json
 test-results/
+.archon/ralph/

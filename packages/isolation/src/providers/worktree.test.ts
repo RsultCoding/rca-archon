@@ -1,6 +1,11 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn, mock, type Mock } from 'bun:test';
+import { join } from 'node:path';
 
-// Mock logger to suppress noisy output during tests
+// Fixed test home — path assertions use this constant; no duplication of production isDocker() logic.
+const TEST_ARCHON_HOME = '/test/.archon';
+
+// Mock @archon/paths: provide getArchonHome + workspaces path helpers so @archon/git (getWorktreeBase,
+// isProjectScopedWorktreeBase) and worktree.ts resolve paths against TEST_ARCHON_HOME consistently.
 mock.module('@archon/paths', () => ({
   createLogger: () => ({
     fatal: () => undefined,
@@ -11,6 +16,12 @@ mock.module('@archon/paths', () => ({
     trace: () => undefined,
     child: () => undefined,
   }),
+  getArchonHome: () => TEST_ARCHON_HOME,
+  getArchonWorkspacesPath: () => join(TEST_ARCHON_HOME, 'workspaces'),
+  getArchonWorktreesPath: () => join(TEST_ARCHON_HOME, 'worktrees'),
+  getProjectWorktreesPath: (owner: string, repo: string) =>
+    join(TEST_ARCHON_HOME, 'workspaces', owner, repo, 'worktrees'),
+  isDocker: () => false,
 }));
 
 import * as git from '@archon/git';
@@ -62,7 +73,13 @@ describe('WorktreeProvider', () => {
 
     // Default mocks for workspace sync
     getDefaultBranchSpy.mockResolvedValue('main');
-    syncWorkspaceSpy.mockResolvedValue({ branch: 'main', synced: true });
+    syncWorkspaceSpy.mockResolvedValue({
+      branch: 'main',
+      synced: true,
+      previousHead: '',
+      newHead: '',
+      updated: false,
+    });
   });
 
   afterEach(() => {
@@ -767,6 +784,37 @@ describe('WorktreeProvider', () => {
       );
 
       await expect(provider.create(request)).rejects.toThrow('Permission denied');
+    });
+
+    test('creates worktree under project-scoped path for locally-registered repo', async () => {
+      const request: IsolationRequest = {
+        codebaseId: 'cb-local',
+        codebaseName: 'Widinglabs/sasha-demo',
+        canonicalRepoPath: '/Users/rasmus/Projects/sasha-demo', // not under workspaces
+        workflowType: 'task',
+        identifier: 'fix-issue-42',
+      };
+
+      worktreeExistsSpy.mockResolvedValue(false);
+      const env = await provider.create(request);
+
+      // workingPath should use project-scoped path, not legacy global worktrees
+      expect(env.workingPath).toBe(
+        join(
+          TEST_ARCHON_HOME,
+          'workspaces',
+          'Widinglabs',
+          'sasha-demo',
+          'worktrees',
+          env.branchName
+        )
+      );
+
+      // mkdir should be called with the project-scoped base (no owner/repo appended)
+      expect(mkdirSpy).toHaveBeenCalledWith(
+        join(TEST_ARCHON_HOME, 'workspaces', 'Widinglabs', 'sasha-demo', 'worktrees'),
+        { recursive: true }
+      );
     });
   });
 
@@ -1764,6 +1812,98 @@ describe('WorktreeProvider', () => {
 
       await expect(provider.create(request)).rejects.toThrow('Failed to check directory');
     });
+
+    test('cleans orphaned git-registered worktree when createFromForkPR fails after worktree add', async () => {
+      const removeWorktreeSpy = spyOn(git, 'removeWorktree');
+      removeWorktreeSpy.mockResolvedValue(undefined);
+
+      const request: IsolationRequest = {
+        codebaseId: 'cb-123',
+        canonicalRepoPath: '/workspace/repo',
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: 'feature/auth',
+        isForkPR: true,
+        prSha: 'abc123',
+      };
+
+      // Directory doesn't exist initially (no orphan directory to clean)
+      accessSpy.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+
+      // First call: worktreeExists returns false (not adopted)
+      // Second call (in cleanup): worktreeExists returns true (orphan exists)
+      worktreeExistsSpy
+        .mockResolvedValueOnce(false) // findExisting check
+        .mockResolvedValueOnce(true); // cleanOrphanWorktreeIfExists check
+
+      // Simulate: fetch succeeds, worktree add succeeds, then checkout -b fails with non-retryable error
+      // Note: syncWorkspace and mkdirAsync are separately mocked, so execSpy only sees
+      // the git calls inside createFromForkPR
+      const checkoutError = new Error('fatal: unable to create branch') as Error & {
+        stderr?: string;
+      };
+      checkoutError.stderr = 'fatal: unable to create branch';
+      execSpy
+        .mockResolvedValueOnce({ stdout: '', stderr: '' }) // fetch origin pull/42/head
+        .mockResolvedValueOnce({ stdout: '', stderr: '' }) // worktree add (succeeds)
+        .mockRejectedValueOnce(checkoutError); // checkout -b (fails, non-retryable)
+
+      await expect(provider.create(request)).rejects.toThrow(
+        'Failed to create worktree for PR #42'
+      );
+
+      // Verify orphan worktree cleanup was attempted
+      expect(removeWorktreeSpy).toHaveBeenCalledWith(
+        '/workspace/repo',
+        expect.stringContaining('pr-42')
+      );
+
+      removeWorktreeSpy.mockRestore();
+    });
+
+    test('propagates original error when orphan worktree cleanup itself fails', async () => {
+      const removeWorktreeSpy = spyOn(git, 'removeWorktree');
+      // Cleanup will fail — but original error should still propagate
+      removeWorktreeSpy.mockRejectedValue(new Error('worktree is locked'));
+
+      const request: IsolationRequest = {
+        codebaseId: 'cb-123',
+        canonicalRepoPath: '/workspace/repo',
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: 'feature/auth',
+        isForkPR: true,
+        prSha: 'abc123',
+      };
+
+      // Directory doesn't exist initially (no orphan directory to clean)
+      accessSpy.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+
+      // First call: worktreeExists returns false (not adopted)
+      // Second call (in cleanup): worktreeExists returns true (orphan exists)
+      worktreeExistsSpy
+        .mockResolvedValueOnce(false) // findExisting check
+        .mockResolvedValueOnce(true); // cleanOrphanWorktreeIfExists check
+
+      const checkoutError = new Error('fatal: unable to create branch') as Error & {
+        stderr?: string;
+      };
+      checkoutError.stderr = 'fatal: unable to create branch';
+      execSpy
+        .mockResolvedValueOnce({ stdout: '', stderr: '' }) // fetch origin pull/42/head
+        .mockResolvedValueOnce({ stdout: '', stderr: '' }) // worktree add (succeeds)
+        .mockRejectedValueOnce(checkoutError); // checkout -b (fails, non-retryable)
+
+      // Original error still propagates despite cleanup failure
+      await expect(provider.create(request)).rejects.toThrow(
+        'Failed to create worktree for PR #42'
+      );
+
+      // Cleanup was attempted (and failed)
+      expect(removeWorktreeSpy).toHaveBeenCalled();
+
+      removeWorktreeSpy.mockRestore();
+    });
   });
 
   describe('workspace sync before worktree creation', () => {
@@ -1817,7 +1957,10 @@ describe('WorktreeProvider', () => {
       await provider.create(baseRequest);
 
       // syncWorkspace called with undefined → triggers auto-detect via getDefaultBranch
-      expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', undefined);
+      // resetAfterFetch: false because test path is not a managed clone under ~/.archon/workspaces
+      expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', undefined, {
+        resetAfterFetch: false,
+      });
     });
 
     test('auto-detects base branch when fromBranch is set but no baseBranch configured', async () => {
@@ -1835,7 +1978,9 @@ describe('WorktreeProvider', () => {
       await provider.create(request);
 
       // fromBranch is the start-point for the branch, not for sync — sync auto-detects
-      expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', undefined);
+      expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', undefined, {
+        resetAfterFetch: false,
+      });
     });
 
     test('uses configuredBaseBranch over fromBranch when both are set', async () => {
@@ -1852,7 +1997,9 @@ describe('WorktreeProvider', () => {
 
       await provider.create(request);
 
-      expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', 'main');
+      expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', 'main', {
+        resetAfterFetch: false,
+      });
     });
 
     test('auto-detects when fromBranch is set but workflowType is not task and no baseBranch', async () => {
@@ -1869,7 +2016,9 @@ describe('WorktreeProvider', () => {
       await provider.create(request);
 
       // fromBranch is ignored for non-task types, so syncWorkspace gets undefined → auto-detect
-      expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', undefined);
+      expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', undefined, {
+        resetAfterFetch: false,
+      });
     });
 
     test('passes configured base branch to workspace sync when provided', async () => {
@@ -1881,7 +2030,9 @@ describe('WorktreeProvider', () => {
 
       await provider.create(baseRequest);
 
-      expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', 'develop');
+      expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', 'develop', {
+        resetAfterFetch: false,
+      });
       expect(getDefaultBranchSpy).not.toHaveBeenCalled();
     });
 
@@ -1991,6 +2142,21 @@ describe('WorktreeProvider', () => {
       const branchName = provider.generateBranchName(request);
       expect(() => provider.getWorktreePath(request, branchName)).toThrow(
         'Cannot extract owner/repo from path "/repo"'
+      );
+    });
+
+    test('getWorktreePath uses codebaseName for locally-registered repo', () => {
+      const request: IsolationRequest = {
+        codebaseId: 'cb-123',
+        codebaseName: 'Widinglabs/sasha-demo',
+        canonicalRepoPath: '/Users/rasmus/Projects/sasha-demo', // not under workspaces
+        workflowType: 'task',
+        identifier: 'fix-issue-42',
+      };
+      const branchName = provider.generateBranchName(request);
+      const path = provider.getWorktreePath(request, branchName);
+      expect(path).toBe(
+        join(TEST_ARCHON_HOME, 'workspaces', 'Widinglabs', 'sasha-demo', 'worktrees', branchName)
       );
     });
   });

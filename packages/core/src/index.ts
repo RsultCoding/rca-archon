@@ -16,6 +16,7 @@ export {
   ConversationNotFoundError,
   type Conversation,
   type HandleMessageContext,
+  type AttachedFile,
   type Codebase,
   type Session,
   type CommandResult,
@@ -98,6 +99,7 @@ export {
   clearConfigCache,
   logConfig,
   toSafeConfig,
+  updateGlobalConfig,
 } from './config/config-loader';
 
 // =============================================================================
@@ -148,6 +150,3 @@ export { getPort } from './utils/port-allocation';
 
 // Worktree sync
 export { syncArchonToWorktree } from './utils/worktree-sync';
-
-// Defaults copy
-export { copyDefaultsToRepo } from './utils/defaults-copy';

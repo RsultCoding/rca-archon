@@ -46,16 +46,27 @@ import {
   workflowListCommand,
   workflowRunCommand,
   workflowStatusCommand,
+  workflowResumeCommand,
+  workflowAbandonCommand,
+  workflowApproveCommand,
+  workflowRejectCommand,
+  workflowCleanupCommand,
+  workflowEventEmitCommand,
+  isValidEventType,
 } from './commands/workflow';
+import { WORKFLOW_EVENT_TYPES } from '@archon/workflows/store';
 import {
   isolationListCommand,
   isolationCleanupCommand,
   isolationCleanupMergedCommand,
   isolationCompleteCommand,
 } from './commands/isolation';
+import { continueCommand } from './commands/continue';
 import { chatCommand } from './commands/chat';
 import { setupCommand } from './commands/setup';
+import { validateWorkflowsCommand, validateCommandsCommand } from './commands/validate';
 import { closeDatabase } from '@archon/core';
+import { createWorkflowStore } from '@archon/core/workflows/store-adapter';
 import { setLogLevel, createLogger } from '@archon/paths';
 import * as git from '@archon/git';
 
@@ -85,7 +96,10 @@ Commands:
   isolation list             List all active worktrees/environments
   isolation cleanup [days]   Remove stale environments (default: 7 days)
   isolation cleanup --merged Remove environments with branches merged into main
+  continue <branch> [msg]    Continue work on an existing worktree with prior context
   complete <branch> [...]    Complete branch lifecycle (remove worktree + branches)
+  validate workflows [name]  Validate workflow definitions and their references
+  validate commands [name]   Validate command files
   version                    Show version info
   help                       Show this help message
 
@@ -99,6 +113,8 @@ Options:
   --quiet, -q                Reduce log verbosity to warnings and errors only
   --verbose, -v              Show debug-level output
   --json                     Output machine-readable JSON (for workflow list)
+  --workflow <name>          Workflow to run for 'continue' (default: archon-assist)
+  --no-context               Skip context injection for 'continue'
 
 Examples:
   archon chat "What does the orchestrator do?"
@@ -107,6 +123,7 @@ Examples:
   archon workflow run plan --cwd /path/to/repo "Add dark mode"
   archon workflow run implement --branch feature-auth "Implement auth"
   archon workflow run quick-fix --no-worktree "Fix typo"
+  archon continue fix/issue-42 --workflow archon-smart-pr-review "Review the changes"
 `);
 }
 
@@ -154,6 +171,13 @@ async function main(): Promise<number> {
         quiet: { type: 'boolean', short: 'q' },
         verbose: { type: 'boolean', short: 'v' },
         json: { type: 'boolean' },
+        'run-id': { type: 'string' },
+        type: { type: 'string' },
+        data: { type: 'string' },
+        comment: { type: 'string' },
+        reason: { type: 'string' },
+        workflow: { type: 'string' },
+        'no-context': { type: 'boolean' },
       },
       allowPositionals: true,
       strict: false, // Allow unknown flags to pass through
@@ -187,7 +211,7 @@ async function main(): Promise<number> {
   const subcommand = positionals[1];
 
   // Commands that don't require git repo validation
-  const noGitCommands = ['version', 'help', 'setup', 'chat'];
+  const noGitCommands = ['version', 'help', 'setup', 'chat', 'continue'];
   const requiresGitRepo = !noGitCommands.includes(command ?? '');
 
   try {
@@ -197,6 +221,14 @@ async function main(): Promise<number> {
     } else if (values.verbose) {
       setLogLevel('debug');
     }
+
+    // Mark workflow runs orphaned by previous process termination as failed
+    void createWorkflowStore()
+      .failOrphanedRuns()
+      .catch((err: unknown) => {
+        const e = err as Error;
+        getLog().warn({ err: e, errorType: e.constructor.name }, 'cli.fail_orphans_failed');
+      });
 
     // Validate working directory exists
     let effectiveCwd = cwd;
@@ -284,8 +316,110 @@ async function main(): Promise<number> {
           }
 
           case 'status':
-            await workflowStatusCommand();
+            await workflowStatusCommand(jsonFlag, values.verbose as boolean | undefined);
             break;
+
+          case 'resume': {
+            const resumeRunId = positionals[2];
+            if (!resumeRunId) {
+              console.error('Usage: archon workflow resume <run-id>');
+              return 1;
+            }
+            await workflowResumeCommand(resumeRunId);
+            break;
+          }
+
+          case 'abandon': {
+            const abandonRunId = positionals[2];
+            if (!abandonRunId) {
+              console.error('Usage: archon workflow abandon <run-id>');
+              return 1;
+            }
+            await workflowAbandonCommand(abandonRunId);
+            break;
+          }
+
+          case 'approve': {
+            const approveRunId = positionals[2];
+            if (!approveRunId) {
+              console.error('Usage: archon workflow approve <run-id> [comment]');
+              return 1;
+            }
+            // Accept comment as positional args (everything after run ID) or --comment flag
+            const approveComment =
+              (values.comment as string | undefined) || positionals.slice(3).join(' ') || undefined;
+            await workflowApproveCommand(approveRunId, approveComment);
+            break;
+          }
+
+          case 'reject': {
+            const rejectRunId = positionals[2];
+            if (!rejectRunId) {
+              console.error('Usage: archon workflow reject <run-id> [--reason "..."]');
+              return 1;
+            }
+            const rejectReason = values.reason as string | undefined;
+            await workflowRejectCommand(rejectRunId, rejectReason);
+            break;
+          }
+
+          case 'cleanup': {
+            const days = positionals[2] ? Number(positionals[2]) : 7;
+            if (Number.isNaN(days) || days < 0) {
+              console.error('Usage: archon workflow cleanup [days]');
+              console.error('  days: delete terminal runs older than N days (default: 7)');
+              return 1;
+            }
+            await workflowCleanupCommand(days);
+            break;
+          }
+
+          case 'event': {
+            const action = positionals[2];
+            if (action !== 'emit') {
+              if (action === undefined) {
+                console.error('Missing workflow event subcommand');
+              } else {
+                console.error(`Unknown workflow event subcommand: ${action}`);
+              }
+              console.error('Available: emit');
+              return 1;
+            }
+            const runId = values['run-id'] as string | undefined;
+            const eventType = values.type as string | undefined;
+            if (!runId) {
+              console.error(
+                'Usage: archon workflow event emit --run-id <uuid> --type <event-type>'
+              );
+              console.error('Error: --run-id is required');
+              return 1;
+            }
+            if (!eventType) {
+              console.error(
+                'Usage: archon workflow event emit --run-id <uuid> --type <event-type>'
+              );
+              console.error('Error: --type is required');
+              return 1;
+            }
+            if (!isValidEventType(eventType)) {
+              console.error(`Error: unknown event type: ${eventType}`);
+              console.error(`Valid types: ${WORKFLOW_EVENT_TYPES.join(', ')}`);
+              return 1;
+            }
+            let eventData: Record<string, unknown> | undefined;
+            const rawData = values.data as string | undefined;
+            if (rawData) {
+              try {
+                eventData = JSON.parse(rawData) as Record<string, unknown>;
+              } catch {
+                console.warn(
+                  `Warning: --data is not valid JSON — event will be emitted without data payload: ${rawData}`
+                );
+              }
+            }
+            await workflowEventEmitCommand(runId, eventType, eventData);
+            break;
+          }
 
           default:
             if (subcommand === undefined) {
@@ -293,7 +427,9 @@ async function main(): Promise<number> {
             } else {
               console.error(`Unknown workflow subcommand: ${subcommand}`);
             }
-            console.error('Available: list, run, status');
+            console.error(
+              'Available: list, run, status, resume, abandon, approve, reject, cleanup, event'
+            );
             return 1;
         }
         break;
@@ -327,6 +463,28 @@ async function main(): Promise<number> {
         }
         break;
 
+      case 'validate':
+        switch (subcommand) {
+          case 'workflows': {
+            const validateName = positionals[2];
+            return await validateWorkflowsCommand(effectiveCwd, validateName, jsonFlag);
+          }
+
+          case 'commands': {
+            const validateName = positionals[2];
+            return await validateCommandsCommand(effectiveCwd, validateName, jsonFlag);
+          }
+
+          default:
+            if (subcommand === undefined) {
+              console.error('Missing validate target');
+            } else {
+              console.error(`Unknown validate target: ${subcommand}`);
+            }
+            console.error('Available: workflows, commands');
+            return 1;
+        }
+
       case 'complete': {
         const branches = positionals.slice(1);
         if (branches.length === 0) {
@@ -335,6 +493,22 @@ async function main(): Promise<number> {
         }
         const forceFlag = args.includes('--force');
         await isolationCompleteCommand(branches, { force: forceFlag, deleteRemote: true });
+        break;
+      }
+
+      case 'continue': {
+        const continueBranch = positionals[1];
+        if (!continueBranch) {
+          console.error('Usage: archon continue <branch> [--workflow <name>] "instruction"');
+          return 1;
+        }
+        const continueMessage = positionals.slice(2).join(' ') || '';
+        const continueWorkflow = values.workflow as string | undefined;
+        const noContextFlag = values['no-context'] as boolean | undefined;
+        await continueCommand(continueBranch, continueMessage, {
+          workflow: continueWorkflow,
+          noContext: noContextFlag,
+        });
         break;
       }
 

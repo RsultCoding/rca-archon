@@ -18,10 +18,12 @@ import {
   getMessages,
   createConversation,
   getWorkflowRunByWorker,
+  getHealth,
 } from '@/lib/api';
 import type { ConversationResponse, CodebaseResponse, MessageResponse } from '@/lib/api';
 import type {
   ChatMessage,
+  FileAttachment,
   ToolCallDisplay,
   ErrorDisplay,
   WorkflowDispatchEvent,
@@ -46,6 +48,7 @@ function mapMessageRow(row: MessageResponse): ChatMessage {
     error?: ErrorDisplay;
     workflowDispatch?: { workerConversationId: string; workflowName: string };
     workflowResult?: { workflowName: string; runId: string };
+    files?: { id?: string; name: string; mimeType: string; size: number }[];
   } = {};
   try {
     meta = JSON.parse(row.metadata) as typeof meta;
@@ -77,6 +80,16 @@ function mapMessageRow(row: MessageResponse): ChatMessage {
     error: meta.error,
     workflowDispatch: meta.workflowDispatch,
     workflowResult: meta.workflowResult,
+    files: Array.isArray(meta.files)
+      ? meta.files
+          .filter(f => typeof f.name === 'string' && typeof f.mimeType === 'string')
+          .map((f, i) => ({
+            id: f.id ?? `${row.id}-file-${String(i)}`,
+            name: f.name,
+            mimeType: f.mimeType,
+            size: typeof f.size === 'number' ? f.size : 0,
+          }))
+      : undefined,
     timestamp: new Date(ensureUtc(row.created_at)).getTime(),
     isStreaming: false,
   };
@@ -111,6 +124,16 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
   }, [messages]);
   const activeWorkflow = useWorkflowStore(selectActiveWorkflow);
   const hydrateWorkflow = useWorkflowStore(s => s.hydrateWorkflow);
+
+  const { data: health } = useQuery({
+    queryKey: ['health'],
+    queryFn: getHealth,
+    staleTime: 10_000,
+    refetchInterval: 30_000,
+    refetchOnWindowFocus: true,
+  });
+  // Default to true (hide button) until server confirms non-Docker — prevents broken vscode:// links
+  const isDocker = health?.is_docker ?? true;
 
   // Sync messages to cache for persistence across navigation
   useEffect(() => {
@@ -150,6 +173,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
           // never match DB-assigned IDs. Keep SSE IDs synthetic to preserve this invariant.
           const activeSSE = prev.filter(
             m =>
+              m.role === 'system' ||
               (m.isStreaming && (m.content || sendActive)) ||
               (m.toolCalls && m.toolCalls.length > 0)
           );
@@ -218,10 +242,9 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
           runId: run.id,
           workflowName: run.workflow_name,
           status: run.status,
-          steps: [],
           dagNodes: [],
           artifacts: [],
-          isLoop: false,
+
           startedAt: new Date(ensureUtc(run.started_at)).getTime(),
           completedAt: run.completed_at
             ? new Date(ensureUtc(run.completed_at)).getTime()
@@ -488,7 +511,19 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
           .then((rows: MessageResponse[]) => {
             if (rows.length === 0) return;
             const hydrated = rows.map(mapMessageRow);
-            setMessages(hydrated);
+            // Preserve client-only system messages (e.g., sync status) when rehydrating
+            setMessages(prev => {
+              const systemMessages = prev.filter(m => m.role === 'system');
+              if (systemMessages.length === 0) return hydrated;
+              // Interleave system messages at their original positions by timestamp
+              const merged = [...hydrated];
+              for (const sys of systemMessages) {
+                const insertIdx = merged.findIndex(m => m.timestamp > sys.timestamp);
+                if (insertIdx === -1) merged.push(sys);
+                else merged.splice(insertIdx, 0, sys);
+              }
+              return merged;
+            });
           })
           .catch(() => {
             // Re-fetch failed — clear stuck placeholder so user can retry
@@ -570,6 +605,18 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
     [onError]
   );
 
+  const onSystemStatus = useCallback((content: string): void => {
+    setMessages(prev => [
+      ...prev,
+      {
+        id: nextId(),
+        role: 'system' as const,
+        content,
+        timestamp: Date.now(),
+      },
+    ]);
+  }, []);
+
   const { connected } = useSSE(isNewChat ? null : conversationId, {
     onText,
     onToolCall,
@@ -580,17 +627,30 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
     onWorkflowDispatch,
     onWarning,
     onRetract,
+    onSystemStatus,
     ...workflowSSEHandlers,
   });
 
   const handleSend = useCallback(
-    async (message: string): Promise<void> => {
+    async (message: string, uploadedFiles?: File[]): Promise<void> => {
+      // Build lightweight attachment metadata for optimistic UI display
+      const fileAttachments: FileAttachment[] | undefined =
+        uploadedFiles && uploadedFiles.length > 0
+          ? uploadedFiles.map(f => ({
+              id: crypto.randomUUID(),
+              name: f.name,
+              mimeType: f.type,
+              size: f.size,
+            }))
+          : undefined;
+
       // Add user message + thinking indicator to UI immediately
       const userMsg: ChatMessage = {
         id: nextId(),
         role: 'user',
         content: message,
         timestamp: Date.now(),
+        files: fileAttachments,
       };
       const thinkingMsg: ChatMessage = {
         id: `thinking-${String(Date.now())}`,
@@ -607,16 +667,29 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
       let targetConversationId = conversationId;
 
       // Create conversation on first message if this is a new chat
+      // Uses atomic create+message to avoid ghost "Untitled conversation" entries
       if (isNewChat) {
         try {
           const { conversationId: newId } = await createConversation(
-            selectedProjectId ?? undefined
+            selectedProjectId ?? undefined,
+            message
           );
           targetConversationId = newId;
           // Cache messages under the new ID so the remounted ChatInterface picks them up
           // (navigate changes the key prop, causing unmount/remount — state is lost otherwise)
           setCachedMessages(newId, [userMsg, thinkingMsg]);
           navigate(`/chat/${newId}`, { replace: true });
+          // Trigger title + workflow refreshes after AI generates a proper title
+          if (!hasTriggeredTitleRefresh.current && !message.startsWith('/')) {
+            hasTriggeredTitleRefresh.current = true;
+            setTimeout(() => {
+              void queryClient.invalidateQueries({ queryKey: ['conversations'] });
+            }, 2000);
+          }
+          void queryClient.invalidateQueries({ queryKey: ['workflow-runs-status'] });
+          void queryClient.invalidateQueries({ queryKey: ['workflowRuns'] });
+          setSending(false);
+          return;
         } catch (error) {
           console.error('[Chat] Failed to create conversation', { error });
           onError({
@@ -631,7 +704,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
       }
 
       try {
-        await apiSendMessage(targetConversationId, message);
+        await apiSendMessage(targetConversationId, message, uploadedFiles);
         // Invalidate conversations cache once after first non-command message
         // so the auto-generated title appears in the sidebar immediately
         if (!hasTriggeredTitleRefresh.current && !message.startsWith('/')) {
@@ -646,8 +719,14 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
         void queryClient.invalidateQueries({ queryKey: ['workflowRuns'] });
       } catch (error) {
         console.error('[Chat] Failed to send message', { error });
+        // Extract server error details from fetchJSON errors (e.g. "API error 400 (...): File ... exceeds...")
+        const errMsg = error instanceof Error ? error.message : undefined;
+        const userMessage =
+          errMsg && /API error 4\d\d/.test(errMsg)
+            ? errMsg.replace(/^API error \d+ \([^)]*\): /, '')
+            : 'Failed to send message. Please try again.';
         onError({
-          message: 'Failed to send message. Please try again.',
+          message: userMessage,
           classification: 'transient',
           suggestedActions: ['Retry'],
         });
@@ -667,12 +746,13 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
   const isStreaming = messages.some(m => m.isStreaming);
 
   return (
-    <div className="flex flex-1 flex-col overflow-hidden">
+    <div className="flex flex-1 flex-col overflow-hidden min-h-0">
       <Header
         title={isNewChat ? 'New Chat' : headerTitle}
         subtitle={headerSubtitle}
         projectName={currentCodebase?.name ?? contextCodebase?.name}
         connected={isNewChat ? undefined : connected}
+        isDocker={isDocker}
       />
       {(conversationsError || codebasesError) && (
         <div className="flex gap-2 px-4 py-1">

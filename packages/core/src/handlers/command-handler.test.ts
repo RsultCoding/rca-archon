@@ -10,12 +10,13 @@
  */
 import { describe, test, expect, mock, beforeEach, afterAll, spyOn, type Mock } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
+import { makeTestWorkflowWithSource } from '@archon/workflows/test-utils';
 import { Conversation } from '../types';
 import { resolve, join } from 'path';
 import * as fsPromises from 'fs/promises';
 import * as gitUtils from '@archon/git';
 import * as pathValidation from '../utils/path-validation';
-import * as workflows from '@archon/workflows';
+import * as workflowDiscovery from '@archon/workflows/workflow-discovery';
 
 // Create mock functions for database modules (safe to mock - no standalone tests)
 const mockUpdateConversation = mock(() => Promise.resolve());
@@ -31,6 +32,14 @@ const mockDeactivateSession = mock(() => Promise.resolve());
 // Workflow database mocks
 const mockGetActiveWorkflowRun = mock(() => Promise.resolve(null));
 const mockCancelWorkflowRun = mock(() => Promise.resolve());
+const mockListWorkflowRuns = mock(() => Promise.resolve([]));
+const mockGetWorkflowRun = mock(() => Promise.resolve(null));
+const mockResumeWorkflowRun = mock(() => Promise.resolve({ id: 'run-id', status: 'running' }));
+const mockFailWorkflowRun = mock(() => Promise.resolve());
+const mockUpdateWorkflowRun = mock(() => Promise.resolve());
+
+// Workflow events database mocks
+const mockCreateWorkflowEvent = mock(() => Promise.resolve());
 
 // Spies for internal modules (use spyOn instead of mock.module to avoid global pollution)
 let spyIsPathWithinWorkspace: ReturnType<typeof spyOn>;
@@ -42,7 +51,6 @@ let spyGetWorktreeBase: ReturnType<typeof spyOn>;
 let spyGetCanonicalRepoPath: ReturnType<typeof spyOn>;
 let spyIsWorktreePath: ReturnType<typeof spyOn>;
 let spyFindWorktreeByBranch: ReturnType<typeof spyOn>;
-let spyCreateWorktreeForIssue: ReturnType<typeof spyOn>;
 let spyMkdirAsync: ReturnType<typeof spyOn>;
 
 // Spies for fs/promises (avoid global mock.module pollution)
@@ -75,6 +83,15 @@ mock.module('../db/sessions', () => ({
 mock.module('../db/workflows', () => ({
   getActiveWorkflowRun: mockGetActiveWorkflowRun,
   cancelWorkflowRun: mockCancelWorkflowRun,
+  listWorkflowRuns: mockListWorkflowRuns,
+  getWorkflowRun: mockGetWorkflowRun,
+  resumeWorkflowRun: mockResumeWorkflowRun,
+  failWorkflowRun: mockFailWorkflowRun,
+  updateWorkflowRun: mockUpdateWorkflowRun,
+}));
+
+mock.module('../db/workflow-events', () => ({
+  createWorkflowEvent: mockCreateWorkflowEvent,
 }));
 
 // Mock isolation-environments database
@@ -95,6 +112,7 @@ const mockIsolationEnvDbCreate = mock(() =>
 const mockIsolationEnvDbGet = mock(() => Promise.resolve(null));
 const mockIsolationEnvDbUpdate = mock(() => Promise.resolve());
 
+const mockCountActiveByCodebase = mock(() => Promise.resolve(0));
 mock.module('../db/isolation-environments', () => ({
   create: mockIsolationEnvDbCreate,
   getById: mockIsolationEnvDbGet,
@@ -103,6 +121,7 @@ mock.module('../db/isolation-environments', () => ({
   markDestroyed: mock(() => Promise.resolve()),
   getActiveByCodebase: mock(() => Promise.resolve([])),
   getActiveEnvironments: mock(() => Promise.resolve([])),
+  countActiveByCodebase: mockCountActiveByCodebase,
 }));
 
 // Mock isolation provider
@@ -140,6 +159,27 @@ mock.module('@archon/isolation', () => ({
     adopt: mock(() => Promise.resolve(null)),
     healthCheck: mock(() => Promise.resolve(true)),
   }),
+}));
+
+// Mock cleanup service
+const mockCleanupMergedWorktrees = mock(() =>
+  Promise.resolve({
+    removed: [] as string[],
+    skipped: [] as { branchName: string; reason: string }[],
+  })
+);
+const mockCleanupStaleWorktrees = mock(() =>
+  Promise.resolve({
+    removed: [] as string[],
+    skipped: [] as { branchName: string; reason: string }[],
+  })
+);
+mock.module('../services/cleanup-service', () => ({
+  cleanupMergedWorktrees: mockCleanupMergedWorktrees,
+  cleanupStaleWorktrees: mockCleanupStaleWorktrees,
+  getWorktreeStatusBreakdown: mock(() =>
+    Promise.resolve({ total: 0, active: 0, merged: 0, stale: 0 })
+  ),
 }));
 
 // Note: We removed mock.module('child_process') because:
@@ -183,6 +223,12 @@ function clearAllMocks(): void {
   // Workflow db mocks
   mockGetActiveWorkflowRun.mockClear();
   mockCancelWorkflowRun.mockClear();
+  mockListWorkflowRuns.mockClear();
+  mockGetWorkflowRun.mockClear();
+  mockResumeWorkflowRun.mockClear();
+  mockFailWorkflowRun.mockClear();
+  mockUpdateWorkflowRun.mockClear();
+  mockCreateWorkflowEvent.mockClear();
   // Isolation mocks
   mockIsolationCreate.mockClear();
   mockIsolationDestroy.mockClear();
@@ -190,6 +236,10 @@ function clearAllMocks(): void {
   mockIsolationEnvDbCreate.mockClear();
   mockIsolationEnvDbGet.mockClear();
   mockIsolationEnvDbUpdate.mockClear();
+  // Cleanup service mocks
+  mockCleanupMergedWorktrees.mockClear();
+  mockCleanupStaleWorktrees.mockClear();
+  mockCountActiveByCodebase.mockClear();
 }
 
 // Setup spies for internal modules
@@ -210,9 +260,6 @@ function setupSpies(): void {
   );
   spyIsWorktreePath = spyOn(gitUtils, 'isWorktreePath').mockResolvedValue(false);
   spyFindWorktreeByBranch = spyOn(gitUtils, 'findWorktreeByBranch').mockResolvedValue(null);
-  spyCreateWorktreeForIssue = spyOn(gitUtils, 'createWorktreeForIssue').mockResolvedValue(
-    '/workspace/worktrees/issue-1'
-  );
   spyMkdirAsync = spyOn(gitUtils, 'mkdirAsync').mockResolvedValue();
 
   // fs/promises spies (avoid global mock.module pollution)
@@ -223,7 +270,7 @@ function setupSpies(): void {
   spyFsRm = spyOn(fsPromises, 'rm').mockImplementation(() => Promise.resolve());
 
   // Workflow spies
-  spyDiscoverWorkflows = spyOn(workflows, 'discoverWorkflowsWithConfig').mockResolvedValue({
+  spyDiscoverWorkflows = spyOn(workflowDiscovery, 'discoverWorkflowsWithConfig').mockResolvedValue({
     workflows: [],
     errors: [],
   });
@@ -240,7 +287,6 @@ function restoreSpies(): void {
   spyGetCanonicalRepoPath?.mockRestore();
   spyIsWorktreePath?.mockRestore();
   spyFindWorktreeByBranch?.mockRestore();
-  spyCreateWorktreeForIssue?.mockRestore();
   spyMkdirAsync?.mockRestore();
   spyFsAccess?.mockRestore();
   spyFsReaddir?.mockRestore();
@@ -870,18 +916,43 @@ describe('CommandHandler', () => {
           expect(mockIsolationCreate).toHaveBeenCalled();
         });
 
-        test('should reject if already using a worktree', async () => {
+        test('should reject if already using a worktree (shows working path, not UUID)', async () => {
           const convWithWorktree: Conversation = {
             ...conversationWithCodebase,
-            isolation_env_id: '/workspace/my-repo/worktrees/existing-branch',
+            isolation_env_id: 'env-uuid-existing',
           };
+
+          // Mock DB lookup to return the working path for this UUID
+          mockIsolationEnvDbGet.mockResolvedValueOnce({
+            id: 'env-uuid-existing',
+            codebase_id: 'codebase-123',
+            working_path: '/workspace/my-repo/worktrees/existing-branch',
+            branch_name: 'existing-branch',
+          });
 
           const result = await handleCommand(convWithWorktree, '/worktree create new-branch');
 
           expect(result.success).toBe(false);
           expect(result.message).toContain('Already using worktree');
           expect(result.message).toMatch(/worktrees[\\\/]existing-branch/);
+          expect(result.message).not.toContain('env-uuid-existing');
           expect(result.message).toContain('/worktree remove first');
+        });
+
+        test('should fallback to UUID when isolation env not found in DB', async () => {
+          const convWithWorktree: Conversation = {
+            ...conversationWithCodebase,
+            isolation_env_id: 'env-uuid-orphaned',
+          };
+
+          // DB lookup returns null (orphaned reference)
+          mockIsolationEnvDbGet.mockResolvedValueOnce(null);
+
+          const result = await handleCommand(convWithWorktree, '/worktree create new-branch');
+
+          expect(result.success).toBe(false);
+          expect(result.message).toContain('Already using worktree');
+          expect(result.message).toContain('env-uuid-orphaned');
         });
       });
 
@@ -984,6 +1055,53 @@ describe('CommandHandler', () => {
           const result = await handleCommand(conversationWithCodebase, '/worktree foo');
           expect(result.success).toBe(false);
           expect(result.message).toContain('Usage');
+        });
+      });
+
+      describe('cleanup', () => {
+        test('should return usage for missing cleanup type', async () => {
+          const result = await handleCommand(conversationWithCodebase, '/worktree cleanup');
+          expect(result.success).toBe(false);
+          expect(result.message).toContain('Usage');
+          expect(result.message).toContain('merged');
+          expect(result.message).toContain('stale');
+        });
+
+        test('should return usage for invalid cleanup type', async () => {
+          const result = await handleCommand(conversationWithCodebase, '/worktree cleanup foo');
+          expect(result.success).toBe(false);
+          expect(result.message).toContain('Usage');
+        });
+
+        test('should report merged worktree cleanup results', async () => {
+          mockCleanupMergedWorktrees.mockResolvedValueOnce({
+            removed: ['feat-old', 'feat-done'],
+            skipped: [{ branchName: 'feat-protected', reason: 'has uncommitted changes' }],
+          });
+          mockCountActiveByCodebase.mockResolvedValueOnce(3);
+
+          const result = await handleCommand(conversationWithCodebase, '/worktree cleanup merged');
+
+          expect(result.success).toBe(true);
+          expect(result.message).toContain('Cleaned up 2 merged worktree(s)');
+          expect(result.message).toContain('feat-old');
+          expect(result.message).toContain('feat-done');
+          expect(result.message).toContain('Skipped 1 (protected)');
+          expect(result.message).toContain('feat-protected');
+          expect(result.message).toContain('Active worktrees: 3');
+        });
+
+        test('should report when no stale worktrees to clean up', async () => {
+          mockCleanupStaleWorktrees.mockResolvedValueOnce({
+            removed: [],
+            skipped: [],
+          });
+          mockCountActiveByCodebase.mockResolvedValueOnce(1);
+
+          const result = await handleCommand(conversationWithCodebase, '/worktree cleanup stale');
+
+          expect(result.success).toBe(true);
+          expect(result.message).toContain('No stale worktrees to clean up');
         });
       });
     });
@@ -1661,6 +1779,50 @@ describe('CommandHandler', () => {
         expect(result.success).toBe(true);
         expect(mockDeactivateSession).toHaveBeenCalledWith('session-repo', 'codebase-changed');
       });
+
+      test('/repo 0 should fail with not-found (out of range)', async () => {
+        spyFsReaddir.mockImplementation((path: string) => {
+          const pathStr = String(path);
+          if (pathStr.endsWith('/workspaces') || pathStr.endsWith('\\workspaces')) {
+            return Promise.resolve([
+              { name: 'octocat', isDirectory: () => true, isFile: () => false },
+            ] as unknown as never[]);
+          }
+          if (pathStr.includes('octocat')) {
+            return Promise.resolve([
+              { name: 'Hello-World', isDirectory: () => true, isFile: () => false },
+            ] as unknown as never[]);
+          }
+          return Promise.resolve([]);
+        });
+
+        const result = await handleCommand(baseConversation, '/repo 0');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Repository not found: 0');
+      });
+
+      test('/repo N where N > count should fail with not-found', async () => {
+        spyFsReaddir.mockImplementation((path: string) => {
+          const pathStr = String(path);
+          if (pathStr.endsWith('/workspaces') || pathStr.endsWith('\\workspaces')) {
+            return Promise.resolve([
+              { name: 'octocat', isDirectory: () => true, isFile: () => false },
+            ] as unknown as never[]);
+          }
+          if (pathStr.includes('octocat')) {
+            return Promise.resolve([
+              { name: 'Hello-World', isDirectory: () => true, isFile: () => false },
+            ] as unknown as never[]);
+          }
+          return Promise.resolve([]);
+        });
+
+        const result = await handleCommand(baseConversation, '/repo 99');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Repository not found: 99');
+      });
     });
 
     describe('/repo-remove with nested structure (Issue #95)', () => {
@@ -1830,6 +1992,11 @@ describe('CommandHandler', () => {
 
         expect(result.success).toBe(true);
         expect(mockDeactivateSession).toHaveBeenCalledWith('session-remove', 'repo-removed');
+        // Verify conversation was unlinked from codebase
+        expect(mockUpdateConversation).toHaveBeenCalledWith(convWithCodebase.id, {
+          codebase_id: null,
+          cwd: null,
+        });
       });
     });
 
@@ -1852,9 +2019,7 @@ describe('CommandHandler', () => {
 
       test('should show load errors alongside workflows', async () => {
         spyDiscoverWorkflows.mockResolvedValueOnce({
-          workflows: [
-            { name: 'assist', description: 'General assistant', steps: [{ command: 'assist' }] },
-          ],
+          workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
           errors: [
             {
               filename: 'broken.yaml',
@@ -1916,7 +2081,7 @@ describe('CommandHandler', () => {
 
       test('should pass loadConfig as second argument to discoverWorkflowsWithConfig', async () => {
         spyDiscoverWorkflows.mockResolvedValueOnce({
-          workflows: [{ name: 'test-wf', description: 'Test', steps: [{ command: 'test' }] }],
+          workflows: [makeTestWorkflowWithSource({ name: 'test-wf', description: 'Test' })],
           errors: [],
         });
 
@@ -1947,7 +2112,7 @@ describe('CommandHandler', () => {
       test('should show error count on reload', async () => {
         spyDiscoverWorkflows.mockResolvedValueOnce({
           workflows: [
-            { name: 'assist', description: 'General assistant', steps: [{ command: 'assist' }] },
+            makeTestWorkflowWithSource({ name: 'assist', description: 'General assistant' }),
           ],
           errors: [
             {
@@ -1957,7 +2122,7 @@ describe('CommandHandler', () => {
             },
             {
               filename: 'invalid.yml',
-              error: "Missing 'steps'",
+              error: "Missing 'nodes'",
               errorType: 'validation_error' as const,
             },
           ],
@@ -1975,7 +2140,7 @@ describe('CommandHandler', () => {
       test('should show clean reload when no errors', async () => {
         spyDiscoverWorkflows.mockResolvedValueOnce({
           workflows: [
-            { name: 'assist', description: 'General assistant', steps: [{ command: 'assist' }] },
+            makeTestWorkflowWithSource({ name: 'assist', description: 'General assistant' }),
           ],
           errors: [],
         });
@@ -2027,7 +2192,7 @@ describe('CommandHandler', () => {
       test('should match workflow name case-insensitively', async () => {
         spyDiscoverWorkflows.mockResolvedValueOnce({
           workflows: [
-            { name: 'assist', description: 'General assistant', steps: [{ command: 'assist' }] },
+            makeTestWorkflowWithSource({ name: 'assist', description: 'General assistant' }),
           ],
           errors: [],
         });
@@ -2065,7 +2230,6 @@ describe('CommandHandler', () => {
           status: 'running',
           started_at: new Date(),
           completed_at: null,
-          current_step_index: 0,
           user_message: 'test',
           metadata: {},
           last_activity_at: new Date(),
@@ -2098,154 +2262,261 @@ describe('CommandHandler', () => {
     });
 
     describe('/workflow status', () => {
-      const conversationWithCodebase: Conversation = {
-        ...baseConversation,
-        codebase_id: 'codebase-123',
-      };
+      test('should show all running workflows', async () => {
+        const startedAt = new Date(Date.now() - 2 * 60 * 1000);
+        mockListWorkflowRuns.mockResolvedValueOnce([
+          {
+            id: 'run-abc123',
+            workflow_name: 'implement',
+            conversation_id: 'conv-1',
+            parent_conversation_id: null,
+            codebase_id: null,
+            status: 'running',
+            user_message: 'add feature',
+            metadata: {},
+            started_at: startedAt,
+            completed_at: null,
+            last_activity_at: startedAt,
+            working_path: '/workspace/worktrees/feat-auth',
+          },
+        ]);
 
-      beforeEach(() => {
-        // Mock getCodebase to return a valid codebase
-        mockGetCodebase.mockResolvedValue({
-          id: 'codebase-123',
-          repository_url: 'https://github.com/test/repo',
-          default_cwd: '/workspace/test-repo',
-          commands: {},
-          created_at: new Date(),
-          updated_at: new Date(),
-        });
-      });
-
-      test('should show detailed workflow status when running', async () => {
-        const startedAt = new Date(Date.now() - 2 * 60 * 1000); // 2 minutes ago
-        const lastActivity = new Date(Date.now() - 30 * 1000); // 30 seconds ago
-        mockGetActiveWorkflowRun.mockResolvedValueOnce({
-          id: 'wf-123',
-          workflow_name: 'test-workflow',
-          conversation_id: 'conv-123',
-          status: 'running',
-          started_at: startedAt,
-          completed_at: null,
-          current_step_index: 1,
-          user_message: 'test',
-          metadata: {},
-          last_activity_at: lastActivity,
-        });
-
-        const result = await handleCommand(conversationWithCodebase, '/workflow status');
+        const result = await handleCommand(baseConversation, '/workflow status');
 
         expect(result.success).toBe(true);
-        expect(result.message).toContain('Workflow: `test-workflow`');
-        expect(result.message).toContain('Status: running');
-        expect(result.message).toContain('Step: 2'); // index + 1
-        expect(result.message).toContain('Duration:');
-        expect(result.message).toContain('Last activity:');
+        expect(result.message).toContain('implement');
+        expect(result.message).toContain('run-abc123');
+        expect(result.message).toContain('/workspace/worktrees/feat-auth');
       });
 
-      test('should indicate when no workflow is running', async () => {
-        mockGetActiveWorkflowRun.mockResolvedValueOnce(null);
+      test('should show no-active message when no workflows running', async () => {
+        mockListWorkflowRuns.mockResolvedValueOnce([]);
 
-        const result = await handleCommand(conversationWithCodebase, '/workflow status');
-
-        expect(result.success).toBe(true);
-        expect(result.message).toBe('No workflow currently running.');
-      });
-
-      test('should warn about stale workflows (>15 minutes)', async () => {
-        const startedAt = new Date(Date.now() - 20 * 60 * 1000); // 20 minutes ago
-        const lastActivity = new Date(Date.now() - 20 * 60 * 1000); // 20 minutes ago
-        mockGetActiveWorkflowRun.mockResolvedValueOnce({
-          id: 'wf-stale',
-          workflow_name: 'stale-workflow',
-          conversation_id: 'conv-123',
-          status: 'running',
-          started_at: startedAt,
-          completed_at: null,
-          current_step_index: 0,
-          user_message: 'test',
-          metadata: {},
-          last_activity_at: lastActivity,
-        });
-
-        const result = await handleCommand(conversationWithCodebase, '/workflow status');
+        const result = await handleCommand(baseConversation, '/workflow status');
 
         expect(result.success).toBe(true);
-        expect(result.message).toContain('appears stale');
-        expect(result.message).toContain('/workflow cancel');
-      });
-
-      test('should warn about slow activity (5-15 minutes)', async () => {
-        const startedAt = new Date(Date.now() - 10 * 60 * 1000); // 10 minutes ago
-        const lastActivity = new Date(Date.now() - 7 * 60 * 1000); // 7 minutes ago
-        mockGetActiveWorkflowRun.mockResolvedValueOnce({
-          id: 'wf-slow',
-          workflow_name: 'slow-workflow',
-          conversation_id: 'conv-123',
-          status: 'running',
-          started_at: startedAt,
-          completed_at: null,
-          current_step_index: 0,
-          user_message: 'test',
-          metadata: {},
-          last_activity_at: lastActivity,
-        });
-
-        const result = await handleCommand(conversationWithCodebase, '/workflow status');
-
-        expect(result.success).toBe(true);
-        expect(result.message).toContain('Activity is slow');
-      });
-
-      test('should use started_at as fallback when last_activity_at is null', async () => {
-        const startedAt = new Date(Date.now() - 1 * 60 * 1000); // 1 minute ago
-        mockGetActiveWorkflowRun.mockResolvedValueOnce({
-          id: 'wf-new',
-          workflow_name: 'new-workflow',
-          conversation_id: 'conv-123',
-          status: 'running',
-          started_at: startedAt,
-          completed_at: null,
-          current_step_index: 0,
-          user_message: 'test',
-          metadata: {},
-          last_activity_at: null,
-        });
-
-        const result = await handleCommand(conversationWithCodebase, '/workflow status');
-
-        expect(result.success).toBe(true);
-        expect(result.message).toContain('Workflow: `new-workflow`');
-        // Should not throw, and should show activity based on started_at
-        expect(result.message).toContain('Last activity:');
+        expect(result.message).toBe('No active workflows.');
       });
 
       test('should handle database errors gracefully', async () => {
-        mockGetActiveWorkflowRun.mockRejectedValueOnce(new Error('Database connection error'));
+        mockListWorkflowRuns.mockRejectedValueOnce(new Error('Database connection error'));
 
-        const result = await handleCommand(conversationWithCodebase, '/workflow status');
+        const result = await handleCommand(baseConversation, '/workflow status');
 
         expect(result.success).toBe(false);
         expect(result.message).toContain('Failed to retrieve workflow status');
       });
 
-      test('should handle invalid date data gracefully', async () => {
-        mockGetActiveWorkflowRun.mockResolvedValueOnce({
-          id: 'wf-invalid',
-          workflow_name: 'invalid-dates-workflow',
-          conversation_id: 'conv-123',
-          status: 'running',
-          started_at: 'invalid-date', // Invalid date string
-          completed_at: null,
-          current_step_index: 0,
-          user_message: 'test',
-          metadata: {},
-          last_activity_at: null,
-        });
+      test('should show working_path as (unknown) when null', async () => {
+        const startedAt = new Date();
+        mockListWorkflowRuns.mockResolvedValueOnce([
+          {
+            id: 'run-xyz',
+            workflow_name: 'assist',
+            conversation_id: 'conv-1',
+            parent_conversation_id: null,
+            codebase_id: null,
+            status: 'running',
+            user_message: 'help',
+            metadata: {},
+            started_at: startedAt,
+            completed_at: null,
+            last_activity_at: null,
+            working_path: null,
+          },
+        ]);
 
-        const result = await handleCommand(conversationWithCodebase, '/workflow status');
+        const result = await handleCommand(baseConversation, '/workflow status');
 
         expect(result.success).toBe(true);
-        expect(result.message).toContain('Workflow: `invalid-dates-workflow`');
-        expect(result.message).toContain('Timing data unavailable');
+        expect(result.message).toContain('(unknown)');
+      });
+    });
+
+    describe('/workflow resume', () => {
+      test('should indicate failed run is ready to resume', async () => {
+        const run = {
+          id: 'run-123',
+          workflow_name: 'implement',
+          conversation_id: 'conv-1',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'failed' as const,
+          user_message: 'test',
+          metadata: {},
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: null,
+          working_path: '/workspace/wt',
+        };
+        mockGetWorkflowRun.mockResolvedValueOnce(run);
+
+        const result = await handleCommand(baseConversation, '/workflow resume run-123');
+
+        expect(result.success).toBe(true);
+        expect(result.message).toContain('ready to resume');
+        expect(result.message).toContain('implement');
+      });
+
+      test('should accept already-failed run without status change', async () => {
+        const run = {
+          id: 'run-456',
+          workflow_name: 'plan',
+          conversation_id: 'conv-1',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'failed' as const,
+          user_message: 'test',
+          metadata: {},
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: null,
+          working_path: null,
+        };
+        mockGetWorkflowRun.mockResolvedValueOnce(run);
+
+        const result = await handleCommand(baseConversation, '/workflow resume run-456');
+
+        expect(result.success).toBe(true);
+        // Already failed — no status change needed
+        expect(mockFailWorkflowRun).not.toHaveBeenCalled();
+      });
+
+      test('should reject resume of non-resumable run', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'run-789',
+          workflow_name: 'assist',
+          conversation_id: 'conv-1',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'running' as const,
+          user_message: 'test',
+          metadata: {},
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: null,
+          working_path: null,
+        });
+
+        const result = await handleCommand(baseConversation, '/workflow resume run-789');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Cannot resume');
+        expect(mockResumeWorkflowRun).not.toHaveBeenCalled();
+      });
+
+      test('should return error when run not found', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce(null);
+
+        const result = await handleCommand(baseConversation, '/workflow resume nonexistent');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('not found');
+      });
+
+      test('should return usage when no id provided', async () => {
+        const result = await handleCommand(baseConversation, '/workflow resume');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Usage: /workflow resume <id>');
+      });
+
+      test('should handle DB error on resume gracefully', async () => {
+        mockGetWorkflowRun.mockRejectedValueOnce(new Error('DB down'));
+
+        const result = await handleCommand(baseConversation, '/workflow resume run-err');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Failed to resume');
+      });
+    });
+
+    describe('/workflow abandon', () => {
+      test('should abandon a running run', async () => {
+        const run = {
+          id: 'run-123',
+          workflow_name: 'implement',
+          conversation_id: 'conv-1',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'running' as const,
+          user_message: 'test',
+          metadata: {},
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: null,
+          working_path: null,
+        };
+        mockGetWorkflowRun.mockResolvedValueOnce(run);
+
+        const result = await handleCommand(baseConversation, '/workflow abandon run-123');
+
+        expect(result.success).toBe(true);
+        expect(result.message).toContain('Abandoned');
+        expect(result.message).toContain('implement');
+        expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-123');
+      });
+
+      test('should reject abandon of already-terminal run', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'run-done',
+          workflow_name: 'assist',
+          conversation_id: 'conv-1',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'completed' as const,
+          user_message: 'test',
+          metadata: {},
+          started_at: new Date(),
+          completed_at: new Date(),
+          last_activity_at: null,
+          working_path: null,
+        });
+
+        const result = await handleCommand(baseConversation, '/workflow abandon run-done');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Cannot abandon');
+        expect(mockFailWorkflowRun).not.toHaveBeenCalled();
+      });
+
+      test('should return error when run not found', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce(null);
+
+        const result = await handleCommand(baseConversation, '/workflow abandon nonexistent');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('not found');
+      });
+
+      test('should return usage when no id provided', async () => {
+        const result = await handleCommand(baseConversation, '/workflow abandon');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Usage: /workflow abandon <id>');
+      });
+
+      test('should handle DB error on abandon gracefully', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'run-err',
+          workflow_name: 'implement',
+          conversation_id: 'conv-1',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'running' as const,
+          user_message: 'test',
+          metadata: {},
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: null,
+          working_path: null,
+        });
+        mockCancelWorkflowRun.mockRejectedValueOnce(new Error('DB down'));
+
+        const result = await handleCommand(baseConversation, '/workflow abandon run-err');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Failed to abandon');
       });
     });
 
@@ -2277,11 +2548,10 @@ describe('CommandHandler', () => {
       test('should return error when workflow is not found', async () => {
         spyDiscoverWorkflows.mockResolvedValueOnce({
           workflows: [
-            {
+            makeTestWorkflowWithSource({
               name: 'existing-workflow',
               description: 'An existing workflow',
-              steps: [{ command: 'assist', args: 'test' }],
-            },
+            }),
           ],
           errors: [],
         });
@@ -2296,11 +2566,7 @@ describe('CommandHandler', () => {
       test('should return success with workflow info when workflow is found', async () => {
         spyDiscoverWorkflows.mockResolvedValueOnce({
           workflows: [
-            {
-              name: 'test-workflow',
-              description: 'A test workflow',
-              steps: [{ command: 'assist', args: 'do something' }],
-            },
+            makeTestWorkflowWithSource({ name: 'test-workflow', description: 'A test workflow' }),
           ],
           errors: [],
         });
@@ -2317,11 +2583,7 @@ describe('CommandHandler', () => {
       test('should pass arguments to workflow', async () => {
         spyDiscoverWorkflows.mockResolvedValueOnce({
           workflows: [
-            {
-              name: 'fix-issue',
-              description: 'Fix a GitHub issue',
-              steps: [{ command: 'assist', args: 'fix $ARGUMENTS' }],
-            },
+            makeTestWorkflowWithSource({ name: 'fix-issue', description: 'Fix a GitHub issue' }),
           ],
           errors: [],
         });
@@ -2394,7 +2656,6 @@ describe('CommandHandler', () => {
           status: 'running',
           started_at: startedAt,
           completed_at: null,
-          current_step_index: 2,
           user_message: 'test',
           metadata: {},
           last_activity_at: lastActivity,
@@ -2404,7 +2665,6 @@ describe('CommandHandler', () => {
 
         expect(result.success).toBe(true);
         expect(result.message).toContain('Active Workflow: `investigate-issue`');
-        expect(result.message).toContain('Step: 3'); // index + 1
         expect(result.message).toContain('Cancel: `/workflow cancel`');
       });
 
@@ -2423,7 +2683,7 @@ describe('CommandHandler', () => {
         expect(result.message).not.toContain('Active Workflow');
       });
 
-      test('should show possibly stale warning in status when activity > 5 minutes', async () => {
+      test('should show active workflow info in status without stale warnings', async () => {
         const conversation: Conversation = {
           ...baseConversation,
           codebase_id: null,
@@ -2433,13 +2693,12 @@ describe('CommandHandler', () => {
         const startedAt = new Date(Date.now() - 10 * 60 * 1000); // 10 minutes ago
         const lastActivity = new Date(Date.now() - 7 * 60 * 1000); // 7 minutes ago
         mockGetActiveWorkflowRun.mockResolvedValueOnce({
-          id: 'wf-stale-status',
+          id: 'wf-active',
           workflow_name: 'long-workflow',
           conversation_id: 'conv-123',
           status: 'running',
           started_at: startedAt,
           completed_at: null,
-          current_step_index: 0,
           user_message: 'test',
           metadata: {},
           last_activity_at: lastActivity,
@@ -2449,7 +2708,8 @@ describe('CommandHandler', () => {
 
         expect(result.success).toBe(true);
         expect(result.message).toContain('Active Workflow');
-        expect(result.message).toContain('(possibly stale)');
+        expect(result.message).toContain('long-workflow');
+        expect(result.message).not.toContain('possibly stale');
       });
 
       test('should gracefully handle workflow database errors in status', async () => {
@@ -2483,7 +2743,6 @@ describe('CommandHandler', () => {
           status: 'running',
           started_at: 'not-a-valid-date', // Invalid date
           completed_at: null,
-          current_step_index: 0,
           user_message: 'test',
           metadata: {},
           last_activity_at: null,
@@ -2492,9 +2751,326 @@ describe('CommandHandler', () => {
         const result = await handleCommand(conversation, '/status');
 
         expect(result.success).toBe(true);
-        // Should still show workflow name but indicate timing unavailable
-        expect(result.message).toContain('Active Workflow: `corrupted-workflow`');
-        expect(result.message).toContain('timing unavailable');
+        // Should still show workflow name
+        expect(result.message).toContain('corrupted-workflow');
+      });
+    });
+
+    describe('/workflow approve — interactive_loop branch', () => {
+      const baseConversation: Conversation = {
+        id: 'conv-approve',
+        platform_type: 'telegram',
+        platform_conversation_id: 'chat-approve',
+        ai_assistant_type: 'claude',
+        codebase_id: null,
+        cwd: null,
+        isolation_env_id: null,
+        last_activity_at: null,
+        created_at: new Date(),
+        updated_at: new Date(),
+      };
+
+      test('routes to interactive_loop branch and stores loop_user_input', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'run-123',
+          workflow_name: 'my-loop-wf',
+          conversation_id: 'conv-approve',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'paused',
+          user_message: 'build it',
+          metadata: {
+            approval: {
+              type: 'interactive_loop',
+              nodeId: 'refine',
+              iteration: 2,
+              message: 'Review the output',
+            },
+          },
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: new Date(),
+          working_path: '/repo',
+        });
+
+        const result = await handleCommand(
+          baseConversation,
+          '/workflow approve run-123 Add error handling'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.message).toContain('loop input received');
+        expect(result.message).toContain('my-loop-wf');
+        expect(mockUpdateWorkflowRun).toHaveBeenCalledWith('run-123', {
+          status: 'failed',
+          metadata: { loop_user_input: 'Add error handling' },
+        });
+      });
+
+      test('creates approval_received event (not node_completed) for interactive_loop', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'run-456',
+          workflow_name: 'loop-wf',
+          conversation_id: 'conv-approve',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'paused',
+          user_message: 'start',
+          metadata: {
+            approval: {
+              type: 'interactive_loop',
+              nodeId: 'implement',
+              iteration: 1,
+              message: 'Review iteration output',
+            },
+          },
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: new Date(),
+          working_path: null,
+        });
+
+        await handleCommand(baseConversation, '/workflow approve run-456 LGTM');
+
+        // node_completed should NOT be written by the approve command — only the executor
+        // writes it when the AI emits the completion signal (actual loop exit).
+        const nodeCompletedCalls = mockCreateWorkflowEvent.mock.calls.filter(
+          (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_completed'
+        );
+        expect(nodeCompletedCalls.length).toBe(0);
+        expect(mockCreateWorkflowEvent).toHaveBeenCalledWith(
+          expect.objectContaining({ event_type: 'approval_received' })
+        );
+      });
+
+      test('returns error when run is not paused', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'run-789',
+          workflow_name: 'loop-wf',
+          conversation_id: 'conv-approve',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'running',
+          user_message: 'start',
+          metadata: {},
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: new Date(),
+          working_path: null,
+        });
+
+        const result = await handleCommand(baseConversation, '/workflow approve run-789 feedback');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('paused');
+      });
+
+      test('returns error when run not found', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce(null);
+
+        const result = await handleCommand(
+          baseConversation,
+          '/workflow approve missing-run feedback'
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('not found');
+      });
+    });
+
+    describe('/workflow approve — standard approval node with captureResponse', () => {
+      const baseConversation: Conversation = {
+        id: 'conv-approve',
+        platform_type: 'telegram',
+        platform_conversation_id: 'chat-approve',
+        ai_assistant_type: 'claude',
+        codebase_id: null,
+        cwd: null,
+        isolation_env_id: null,
+        last_activity_at: null,
+        created_at: new Date(),
+        updated_at: new Date(),
+      };
+
+      test('stores user comment as node_output when captureResponse is true', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'run-cap',
+          workflow_name: 'capture-wf',
+          conversation_id: 'conv-approve',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'paused',
+          user_message: 'start',
+          metadata: {
+            approval: {
+              type: 'approval',
+              nodeId: 'review',
+              message: 'Approve?',
+              captureResponse: true,
+            },
+          },
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: new Date(),
+          working_path: '/repo',
+        });
+
+        await handleCommand(baseConversation, '/workflow approve run-cap LGTM looks good');
+
+        const nodeCompletedCall = mockCreateWorkflowEvent.mock.calls.find(
+          (c: unknown[]) => (c[0] as Record<string, unknown>).event_type === 'node_completed'
+        );
+        expect(nodeCompletedCall?.[0]).toMatchObject({
+          data: { node_output: 'LGTM looks good', approval_decision: 'approved' },
+        });
+      });
+
+      test('stores empty node_output when captureResponse is not set', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'run-nocap',
+          workflow_name: 'nocapture-wf',
+          conversation_id: 'conv-approve',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'paused',
+          user_message: 'start',
+          metadata: {
+            approval: {
+              type: 'approval',
+              nodeId: 'review',
+              message: 'Approve?',
+            },
+          },
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: new Date(),
+          working_path: '/repo',
+        });
+
+        await handleCommand(baseConversation, '/workflow approve run-nocap a comment');
+
+        const nodeCompletedCall = mockCreateWorkflowEvent.mock.calls.find(
+          (c: unknown[]) => (c[0] as Record<string, unknown>).event_type === 'node_completed'
+        );
+        expect(nodeCompletedCall?.[0]).toMatchObject({
+          data: { node_output: '', approval_decision: 'approved' },
+        });
+      });
+    });
+
+    describe('/workflow reject — on_reject branch', () => {
+      const baseConversation: Conversation = {
+        id: 'conv-approve',
+        platform_type: 'telegram',
+        platform_conversation_id: 'chat-approve',
+        ai_assistant_type: 'claude',
+        codebase_id: null,
+        cwd: null,
+        isolation_env_id: null,
+        last_activity_at: null,
+        created_at: new Date(),
+        updated_at: new Date(),
+      };
+
+      test('records rejection and increments count when on_reject configured', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'run-reject-1',
+          workflow_name: 'review-wf',
+          conversation_id: 'conv-approve',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'paused',
+          user_message: 'review this',
+          metadata: {
+            approval: {
+              type: 'approval',
+              nodeId: 'review',
+              message: 'Approve the plan?',
+              onRejectPrompt: 'Fix: $REJECTION_REASON',
+              onRejectMaxAttempts: 3,
+            },
+            rejection_count: 0,
+          },
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: new Date(),
+          working_path: '/repo',
+        });
+
+        const result = await handleCommand(
+          baseConversation,
+          '/workflow reject run-reject-1 needs work'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.message).toContain('Reworking');
+        expect(mockUpdateWorkflowRun).toHaveBeenCalledWith('run-reject-1', {
+          status: 'failed',
+          metadata: { rejection_reason: 'needs work', rejection_count: 1 },
+        });
+      });
+
+      test('cancels when max attempts reached', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'run-reject-max',
+          workflow_name: 'review-wf',
+          conversation_id: 'conv-approve',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'paused',
+          user_message: 'review this',
+          metadata: {
+            approval: {
+              type: 'approval',
+              nodeId: 'review',
+              message: 'Approve?',
+              onRejectPrompt: 'Fix: $REJECTION_REASON',
+              onRejectMaxAttempts: 3,
+            },
+            rejection_count: 2,
+          },
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: new Date(),
+          working_path: '/repo',
+        });
+
+        const result = await handleCommand(baseConversation, '/workflow reject run-reject-max bad');
+
+        expect(result.success).toBe(true);
+        expect(result.message).toContain('max attempts reached');
+        expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-reject-max');
+      });
+
+      test('cancels immediately without on_reject', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'run-reject-plain',
+          workflow_name: 'plain-wf',
+          conversation_id: 'conv-approve',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'paused',
+          user_message: 'start',
+          metadata: {
+            approval: {
+              type: 'approval',
+              nodeId: 'gate',
+              message: 'Approve?',
+            },
+          },
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: new Date(),
+          working_path: '/repo',
+        });
+
+        const result = await handleCommand(
+          baseConversation,
+          '/workflow reject run-reject-plain reason'
+        );
+
+        expect(result.success).toBe(true);
+        expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-reject-plain');
       });
     });
   });

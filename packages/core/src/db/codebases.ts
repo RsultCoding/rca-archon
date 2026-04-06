@@ -96,7 +96,18 @@ export async function findCodebaseByDefaultCwd(defaultCwd: string): Promise<Code
   return result.rows[0] || null;
 }
 
-export async function updateCodebase(id: string, data: { default_cwd?: string }): Promise<void> {
+export async function findCodebaseByName(name: string): Promise<Codebase | null> {
+  const result = await pool.query<Codebase>(
+    'SELECT * FROM remote_agent_codebases WHERE name = $1 ORDER BY created_at DESC LIMIT 1',
+    [name]
+  );
+  return result.rows[0] || null;
+}
+
+export async function updateCodebase(
+  id: string,
+  data: { default_cwd?: string; repository_url?: string | null }
+): Promise<void> {
   const dialect = getDialect();
   const updates: string[] = [];
   const values: (string | null)[] = [];
@@ -107,15 +118,23 @@ export async function updateCodebase(id: string, data: { default_cwd?: string })
     values.push(data.default_cwd);
   }
 
+  if (data.repository_url !== undefined) {
+    updates.push(`repository_url = $${paramIndex++}`);
+    values.push(data.repository_url);
+  }
+
   if (updates.length === 0) return;
 
   updates.push(`updated_at = ${dialect.now()}`);
   values.push(id);
 
-  await pool.query(
+  const result = await pool.query(
     `UPDATE remote_agent_codebases SET ${updates.join(', ')} WHERE id = $${paramIndex}`,
     values
   );
+  if ((result.rowCount ?? 0) === 0) {
+    throw new Error(`Codebase ${id} not found`);
+  }
 }
 
 export async function listCodebases(): Promise<readonly Codebase[]> {

@@ -9,17 +9,25 @@
  */
 
 import { readFile as fsReadFile, writeFile, mkdir } from 'fs/promises';
-
-// Wrapper function for reading files - allows mocking without polluting fs/promises globally
-export async function readConfigFile(path: string): Promise<string> {
-  return fsReadFile(path, 'utf-8');
-}
 import { join, dirname } from 'path';
 import {
   getArchonConfigPath,
   getArchonWorkspacesPath,
   getArchonWorktreesPath,
 } from '@archon/paths';
+
+// Wrapper functions for file I/O - allows mocking without polluting fs/promises globally
+export async function readConfigFile(path: string): Promise<string> {
+  return fsReadFile(path, 'utf-8');
+}
+
+export async function writeConfigFile(
+  path: string,
+  content: string,
+  options?: { flag?: string }
+): Promise<void> {
+  await writeFile(path, content, { encoding: 'utf-8', ...options });
+}
 import type { GlobalConfig, RepoConfig, MergedConfig, SafeConfig } from './config-types';
 import { createLogger } from '@archon/paths';
 
@@ -44,7 +52,7 @@ let cachedGlobalConfig: GlobalConfig | null = null;
  * Default config file content
  */
 const DEFAULT_CONFIG_CONTENT = `# Archon Global Configuration
-# See: https://github.com/dynamous-community/remote-coding-agent/blob/main/docs/configuration.md
+# See: https://github.com/coleam00/Archon/blob/main/docs/configuration.md
 
 # Bot display name (shown in messages)
 # botName: Archon
@@ -97,7 +105,7 @@ function logConfigError(configPath: string, error: unknown): void {
 async function createDefaultConfig(configPath: string): Promise<void> {
   try {
     await mkdir(dirname(configPath), { recursive: true });
-    await writeFile(configPath, DEFAULT_CONFIG_CONTENT, { flag: 'wx' }); // wx = fail if exists
+    await writeConfigFile(configPath, DEFAULT_CONFIG_CONTENT, { flag: 'wx' }); // wx = fail if exists
     getLog().info({ configPath }, 'default_config_created');
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
@@ -273,6 +281,9 @@ function mergeGlobalConfig(defaults: MergedConfig, global: GlobalConfig): Merged
   if (global.assistants?.claude?.model) {
     result.assistants.claude.model = global.assistants.claude.model;
   }
+  if (global.assistants?.claude?.settingSources) {
+    result.assistants.claude.settingSources = global.assistants.claude.settingSources;
+  }
   if (global.assistants?.codex) {
     result.assistants.codex = {
       ...result.assistants.codex,
@@ -322,6 +333,9 @@ function mergeRepoConfig(merged: MergedConfig, repo: RepoConfig): MergedConfig {
   if (repo.assistants?.claude?.model) {
     result.assistants.claude.model = repo.assistants.claude.model;
   }
+  if (repo.assistants?.claude?.settingSources) {
+    result.assistants.claude.settingSources = repo.assistants.claude.settingSources;
+  }
   if (repo.assistants?.codex) {
     result.assistants.codex = {
       ...result.assistants.codex,
@@ -352,6 +366,11 @@ function mergeRepoConfig(merged: MergedConfig, repo: RepoConfig): MergedConfig {
   // Propagate base branch for $BASE_BRANCH substitution in workflow commands
   if (repo.worktree?.baseBranch?.trim()) {
     result.baseBranch = repo.worktree.baseBranch.trim();
+  }
+
+  // Propagate per-project env vars from repo config
+  if (repo.env) {
+    result.envVars = { ...result.envVars, ...repo.env };
   }
 
   return result;
@@ -404,6 +423,61 @@ export function logConfig(config: MergedConfig): void {
 }
 
 /**
+ * Update global config (~/.archon/config.yaml) with partial updates.
+ * Reads current config, deep-merges updates, and writes back to YAML.
+ * Invalidates the cached config so next loadConfig() picks up changes.
+ */
+export async function updateGlobalConfig(updates: Partial<GlobalConfig>): Promise<void> {
+  const configPath = getArchonConfigPath();
+
+  try {
+    // Force reload to get fresh state
+    const current = await loadGlobalConfig(true);
+
+    // Deep-merge: only overwrite defined keys
+    const merged: GlobalConfig = { ...current };
+
+    if (updates.botName !== undefined) merged.botName = updates.botName;
+    if (updates.defaultAssistant !== undefined) merged.defaultAssistant = updates.defaultAssistant;
+
+    if (updates.assistants) {
+      merged.assistants = {
+        claude: { ...current.assistants?.claude, ...updates.assistants.claude },
+        codex: { ...current.assistants?.codex, ...updates.assistants.codex },
+      };
+    }
+
+    if (updates.streaming) {
+      merged.streaming = { ...current.streaming, ...updates.streaming };
+    }
+
+    if (updates.concurrency) {
+      merged.concurrency = { ...current.concurrency, ...updates.concurrency };
+    }
+
+    // Serialize to YAML and write
+    const yaml = Bun.YAML.stringify(merged);
+    await mkdir(dirname(configPath), { recursive: true });
+    await writeConfigFile(configPath, yaml);
+
+    // Invalidate cache so next loadConfig() re-reads
+    cachedGlobalConfig = null;
+
+    getLog().info({ configPath }, 'config.update_completed');
+  } catch (error) {
+    const err = error as { code?: string; message?: string };
+
+    if (err.code === 'EACCES' || err.code === 'EPERM') {
+      getLog().error({ configPath, err: error, code: err.code }, 'config.update_permission_denied');
+    } else {
+      getLog().error({ configPath, err: error }, 'config.update_failed');
+    }
+
+    throw error;
+  }
+}
+
+/**
  * Project a MergedConfig to a SafeConfig suitable for sending to web clients.
  * Strips filesystem paths and any other server-internal fields.
  */
@@ -412,7 +486,9 @@ export function toSafeConfig(config: MergedConfig): SafeConfig {
     botName: config.botName,
     assistant: config.assistant,
     assistants: {
-      claude: { model: config.assistants.claude.model },
+      claude: {
+        model: config.assistants.claude.model,
+      },
       codex: {
         model: config.assistants.codex.model,
         modelReasoningEffort: config.assistants.codex.modelReasoningEffort,

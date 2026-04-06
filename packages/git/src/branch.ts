@@ -14,8 +14,9 @@ function getLog(): ReturnType<typeof createLogger> {
  * Get the default branch name for a repository
  * Uses git symbolic-ref to get the remote HEAD reference
  *
- * Fallback chain: symbolic-ref -> origin/main -> origin/master
- * Note: Fallback is common for freshly cloned repos where origin/HEAD isn't set.
+ * Fallback chain: symbolic-ref -> origin/main -> throw
+ * Note: Throws if neither origin/HEAD nor origin/main can be resolved.
+ * Callers can set worktree.baseBranch in .archon/config.yaml as a manual override.
  *
  * Only falls back for expected git errors (ref not found, branch not found).
  * Throws for unexpected errors (permission denied, git corruption, etc.)
@@ -47,7 +48,7 @@ export async function getDefaultBranch(repoPath: RepoPath): Promise<BranchName> 
     }
   }
 
-  // Fallback: check if origin/main exists, otherwise assume master
+  // Fallback: check if origin/main exists, otherwise throw
   try {
     await execFileAsync('git', ['-C', repoPath, 'rev-parse', '--verify', 'origin/main'], {
       timeout: 10000,
@@ -57,14 +58,17 @@ export async function getDefaultBranch(repoPath: RepoPath): Promise<BranchName> 
     const err = error as Error & { stderr?: string };
     const errorText = `${err.message} ${err.stderr ?? ''}`;
 
-    // Expected: origin/main doesn't exist
+    // Expected: origin/main doesn't exist — no safe default, fail fast
     if (
       errorText.includes('Not a valid object name') ||
       errorText.includes('Needed a single revision') ||
       errorText.includes('unknown revision')
     ) {
-      getLog().debug({ repoPath, err }, 'origin_main_not_found_defaulting_to_master');
-      return toBranchName('master');
+      getLog().warn({ repoPath }, 'default_branch_detection_failed');
+      throw new Error(
+        `Cannot detect default branch for ${repoPath}: neither origin/HEAD nor origin/main exist. ` +
+          'Set worktree.baseBranch in .archon/config.yaml to specify the branch explicitly.'
+      );
     }
 
     // Unexpected error - surface it
@@ -212,6 +216,47 @@ export async function isBranchMerged(
     getLog().error({ err: error, repoPath, branchName, mainBranch }, 'branch_merge_check_failed');
     throw new Error(
       `Failed to check if ${branchName} is merged into ${mainBranch}: ${err.message}`
+    );
+  }
+}
+
+/**
+ * Check if a ref is an ancestor of HEAD in the given working directory.
+ *
+ * Returns true if ancestorRef is an ancestor of HEAD (worktree is based on that branch).
+ * Returns false if it is not (base branch mismatch detected).
+ * Returns false for expected errors (branch not found, not a git repo).
+ * Throws for unexpected errors (permission denied, corruption).
+ */
+export async function isAncestorOf(
+  workingPath: RepoPath | WorktreePath,
+  ancestorRef: string
+): Promise<boolean> {
+  try {
+    await execFileAsync('git', [
+      '-C',
+      workingPath,
+      'merge-base',
+      '--is-ancestor',
+      ancestorRef,
+      'HEAD',
+    ]);
+    return true;
+  } catch (error) {
+    const err = error as Error & { code?: number | string; stderr?: string };
+    // exit code 1 = not an ancestor — expected case
+    if (err.code === 1) return false;
+    const errorText = `${err.message} ${err.stderr ?? ''}`.toLowerCase();
+    const isExpectedError =
+      errorText.includes('not a git repository') ||
+      errorText.includes('unknown revision') ||
+      errorText.includes('not a valid object name') ||
+      errorText.includes('no such file') ||
+      err.code === 'ENOENT';
+    if (isExpectedError) return false;
+    getLog().error({ err: error, workingPath, ancestorRef }, 'branch.ancestor_check_failed');
+    throw new Error(
+      `Failed to check if ${ancestorRef} is ancestor of HEAD at ${workingPath}: ${(err as Error).message}`
     );
   }
 }

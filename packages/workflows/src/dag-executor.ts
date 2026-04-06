@@ -18,15 +18,17 @@ import type {
 } from './deps';
 import type {
   DagNode,
+  ApprovalNode,
   BashNode,
   CommandNode,
   PromptNode,
+  LoopNode,
   NodeOutput,
   TriggerRule,
   WorkflowRun,
   WorkflowNodeHooks,
-} from './types';
-import { isBashNode } from './types';
+} from './schemas';
+import { isBashNode, isLoopNode, isApprovalNode, isCancelNode, isApprovalContext } from './schemas';
 import { formatToolCall } from './utils/tool-formatter';
 import { createLogger } from '@archon/paths';
 import { getWorkflowEventEmitter } from './event-emitter';
@@ -45,9 +47,12 @@ import {
 import { withIdleTimeout, STEP_IDLE_TIMEOUT_MS } from './utils/idle-timeout';
 import {
   classifyError,
+  detectCreditExhaustion,
   loadCommandPrompt,
   substituteWorkflowVariables,
   buildPromptWithContext,
+  detectCompletionSignal,
+  stripCompletionTags,
 } from './executor-shared';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -57,9 +62,13 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
-/** Throttle state for activity updates + cancel checks inside streaming loops */
+/** Throttle state for cancel checks (reads — no write contention in WAL mode) */
+const lastNodeCancelCheck = new Map<string, number>();
+const CANCEL_CHECK_INTERVAL_MS = 10_000;
+
+/** Throttle state for activity heartbeat writes (only used for stale/zombie detection) */
 const lastNodeActivityUpdate = new Map<string, number>();
-const NODE_ACTIVITY_UPDATE_INTERVAL_MS = 10_000;
+const ACTIVITY_HEARTBEAT_INTERVAL_MS = 60_000;
 
 /** Context for platform message sending */
 interface SendMessageContext {
@@ -362,23 +371,6 @@ async function resolveNodeProviderAndModel(
     );
   }
 
-  // Warn if Codex node has output_format (unsupported)
-  if (provider === 'codex' && node.output_format) {
-    getLog().warn({ nodeId: node.id }, 'dag_node_output_format_ignored_codex');
-    const outputFormatDelivered = await safeSendMessage(
-      platform,
-      conversationId,
-      `Warning: Node '${node.id}' has output_format set but uses Codex — output_format is ignored. Use a Claude node for structured output.`,
-      { workflowId: workflowRunId, nodeName: node.id }
-    );
-    if (!outputFormatDelivered) {
-      getLog().error(
-        { nodeId: node.id, workflowRunId },
-        'dag_node_output_format_warning_delivery_failed'
-      );
-    }
-  }
-
   // Warn if Codex node has allowed_tools or denied_tools (unsupported per-call)
   if (
     provider === 'codex' &&
@@ -446,9 +438,16 @@ async function resolveNodeProviderAndModel(
       webSearchMode: config.assistants.codex.webSearchMode,
       additionalDirectories: config.assistants.codex.additionalDirectories,
     };
+    if (node.output_format) {
+      options.outputFormat = { type: 'json_schema', schema: node.output_format };
+    }
   } else {
     const claudeOptions: WorkflowAssistantOptions = {};
     if (model) claudeOptions.model = model;
+    // Propagate settingSources from config (controls which CLAUDE.md files the SDK loads)
+    if (config.assistants.claude.settingSources) {
+      claudeOptions.settingSources = config.assistants.claude.settingSources;
+    }
     if (provider === 'claude' && node.output_format) {
       claudeOptions.outputFormat = {
         type: 'json_schema',
@@ -540,6 +539,10 @@ async function resolveNodeProviderAndModel(
         claudeOptions.allowedTools = [...(claudeOptions.allowedTools ?? []), 'Skill'];
       }
       getLog().info({ nodeId: node.id, skills: node.skills, agentId }, 'dag.skills_agent_created');
+    }
+    // Inject per-project env vars (config file + DB) into subprocess env
+    if (config.envVars && Object.keys(config.envVars).length > 0) {
+      claudeOptions.env = config.envVars;
     }
     options = Object.keys(claudeOptions).length > 0 ? claudeOptions : undefined;
   }
@@ -755,9 +758,12 @@ async function executeNodeInternal(
 
   // Create per-node abort controller for idle timeout cleanup
   const nodeAbortController = new AbortController();
+  // Fork when resuming — leaves the source session untouched so retries are safe.
+  const shouldForkSession = resumeSessionId !== undefined;
   const nodeOptionsWithAbort: WorkflowAssistantOptions | undefined = {
     ...nodeOptions,
     abortSignal: nodeAbortController.signal,
+    ...(shouldForkSession ? { forkSession: true } : {}),
   };
   let nodeIdleTimedOut = false;
   const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
@@ -774,17 +780,35 @@ async function executeNodeInternal(
           'dag_node_idle_timeout_reached'
         );
         nodeAbortController.abort();
-      },
-      msg => msg.type !== 'tool'
+      }
     )) {
-      // Update activity timestamp + check cancel (throttled to once per 10s)
-      const activityNow = Date.now();
+      const tickNow = Date.now();
       const nodeKey = `${workflowRun.id}:${node.id}`;
-      if (
-        activityNow - (lastNodeActivityUpdate.get(nodeKey) ?? 0) >
-        NODE_ACTIVITY_UPDATE_INTERVAL_MS
-      ) {
-        lastNodeActivityUpdate.set(nodeKey, activityNow);
+
+      // Cancel/pause check — read-only, no write contention in WAL mode (every 10s)
+      if (tickNow - (lastNodeCancelCheck.get(nodeKey) ?? 0) > CANCEL_CHECK_INTERVAL_MS) {
+        lastNodeCancelCheck.set(nodeKey, tickNow);
+        try {
+          const streamStatus = await deps.store.getWorkflowRunStatus(workflowRun.id);
+          if (streamStatus === null || streamStatus !== 'running') {
+            getLog().info(
+              { workflowRunId: workflowRun.id, nodeId: node.id, status: streamStatus ?? 'deleted' },
+              'dag.stop_detected_during_streaming'
+            );
+            nodeAbortController.abort();
+            break;
+          }
+        } catch (cancelCheckErr) {
+          getLog().warn(
+            { err: cancelCheckErr as Error, workflowRunId: workflowRun.id, nodeId: node.id },
+            'dag.status_check_failed'
+          );
+        }
+      }
+
+      // Activity heartbeat — write, throttled to every 60s (only for stale/zombie detection)
+      if (tickNow - (lastNodeActivityUpdate.get(nodeKey) ?? 0) > ACTIVITY_HEARTBEAT_INTERVAL_MS) {
+        lastNodeActivityUpdate.set(nodeKey, tickNow);
         try {
           await deps.store.updateWorkflowActivity(workflowRun.id);
         } catch (e) {
@@ -792,21 +816,6 @@ async function executeNodeInternal(
             { err: e as Error, workflowRunId: workflowRun.id },
             'dag.activity_update_failed'
           );
-        }
-
-        // Check for cancellation during node streaming (not just between layers)
-        try {
-          const streamStatus = await deps.store.getWorkflowRunStatus(workflowRun.id);
-          if (streamStatus === 'cancelled') {
-            getLog().info(
-              { workflowRunId: workflowRun.id, nodeId: node.id },
-              'dag.cancel_detected_during_streaming'
-            );
-            nodeAbortController.abort();
-            break;
-          }
-        } catch (cancelCheckErr) {
-          getLog().warn({ err: cancelCheckErr as Error }, 'dag.cancel_check_failed');
         }
       }
 
@@ -824,6 +833,13 @@ async function executeNodeInternal(
         // Emit tool_completed for the previous tool (fire-and-forget)
         if (lastToolStartedAt) {
           const prevTool = lastToolStartedAt;
+          getWorkflowEventEmitter().emit({
+            type: 'tool_completed',
+            runId: workflowRun.id,
+            toolName: prevTool.toolName,
+            stepName: node.id,
+            durationMs: now - prevTool.startedAt,
+          });
           deps.store
             .createWorkflowEvent({
               workflow_run_id: workflowRun.id,
@@ -842,6 +858,14 @@ async function executeNodeInternal(
             });
         }
         lastToolStartedAt = { toolName: msg.toolName, startedAt: now };
+
+        // Emit tool_started for the current tool (fire-and-forget)
+        getWorkflowEventEmitter().emit({
+          type: 'tool_started',
+          runId: workflowRun.id,
+          toolName: msg.toolName,
+          stepName: node.id,
+        });
 
         if (streamingMode === 'stream') {
           const toolMsg = formatToolCall(msg.toolName, msg.toolInput);
@@ -881,6 +905,13 @@ async function executeNodeInternal(
         // Emit tool_completed for the last tool in the node
         if (lastToolStartedAt) {
           const prevTool = lastToolStartedAt;
+          getWorkflowEventEmitter().emit({
+            type: 'tool_completed',
+            runId: workflowRun.id,
+            toolName: prevTool.toolName,
+            stepName: node.id,
+            durationMs: Date.now() - prevTool.startedAt,
+          });
           deps.store
             .createWorkflowEvent({
               workflow_run_id: workflowRun.id,
@@ -902,6 +933,7 @@ async function executeNodeInternal(
         if (msg.sessionId) newSessionId = msg.sessionId;
         if (msg.tokens) nodeTokens = msg.tokens;
         if (msg.structuredOutput !== undefined) structuredOutput = msg.structuredOutput;
+        break; // Result is the "I'm done" signal — don't wait for subprocess to exit
       } else if (msg.type === 'system' && msg.content) {
         // Surface MCP connection failures to the user
         if (msg.content.startsWith('MCP server connection failed:')) {
@@ -946,6 +978,25 @@ async function executeNodeInternal(
           );
         }
         getLog().debug({ nodeId: node.id, streamingMode }, 'dag.structured_output_override');
+      } else if (provider === 'codex') {
+        // Codex returns structured output inline in agent_message text
+        // (already accumulated in nodeOutputText). Validate it is valid JSON
+        // so downstream $nodeId.output.field references can parse it.
+        try {
+          JSON.parse(nodeOutputText);
+          getLog().debug({ nodeId: node.id }, 'dag.codex_structured_output_valid_json');
+        } catch {
+          getLog().warn(
+            { nodeId: node.id, outputPreview: nodeOutputText.slice(0, 200) },
+            'dag.codex_structured_output_not_json'
+          );
+          await safeSendMessage(
+            platform,
+            conversationId,
+            `Warning: Node '${node.id}' requested output_format but Codex returned non-JSON output. Downstream conditions referencing \`$${node.id}.output.field\` may not evaluate correctly.`,
+            nodeContext
+          );
+        }
       } else {
         getLog().warn(
           { nodeId: node.id, workflowRunId: workflowRun.id },
@@ -1004,7 +1055,8 @@ async function executeNodeInternal(
         error: 'Cancelled by user',
       });
 
-      // Clean up throttle entry
+      // Clean up throttle entries
+      lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
       lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
       return { state: 'failed', output: nodeOutputText, error: 'Cancelled by user' };
@@ -1016,6 +1068,42 @@ async function executeNodeInternal(
           ? nodeOutputText
           : batchMessages.join('\n\n');
       await safeSendMessage(platform, conversationId, batchContent, nodeContext);
+    }
+
+    // Detect credit exhaustion: SDK returns it as assistant text, not a thrown error.
+    const creditError = detectCreditExhaustion(nodeOutputText);
+
+    if (creditError) {
+      const duration = Date.now() - nodeStartTime;
+      getLog().warn({ nodeId: node.id, durationMs: duration }, 'dag.node_credit_exhausted');
+      await logNodeError(logDir, workflowRun.id, node.id, creditError);
+
+      deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'node_failed',
+          step_name: node.id,
+          data: { error: creditError },
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
+            'workflow_event_persist_failed'
+          );
+        });
+
+      emitter.emit({
+        type: 'node_failed',
+        runId: workflowRun.id,
+        nodeId: node.id,
+        nodeName: node.command ?? node.id,
+        error: creditError,
+      });
+
+      lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
+      lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
+
+      return { state: 'failed', output: nodeOutputText, error: creditError };
     }
 
     const duration = Date.now() - nodeStartTime;
@@ -1030,7 +1118,7 @@ async function executeNodeInternal(
         workflow_run_id: workflowRun.id,
         event_type: 'node_completed',
         step_name: node.id,
-        data: { duration_ms: duration },
+        data: { duration_ms: duration, node_output: nodeOutputText },
       })
       .catch((err: Error) => {
         getLog().error(
@@ -1047,14 +1135,16 @@ async function executeNodeInternal(
       duration,
     });
 
-    // Clean up throttle entry on completion
+    // Clean up throttle entries on completion
+    lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
     lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
     return { state: 'completed', output: nodeOutputText, sessionId: newSessionId };
   } catch (error) {
     const err = error as Error;
 
-    // Clean up throttle entry on failure
+    // Clean up throttle entries on failure
+    lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
     lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
     // If the abort was triggered by user cancel (not idle timeout), classify as cancel
@@ -1182,7 +1272,7 @@ async function executeBashNode(
         workflow_run_id: workflowRun.id,
         event_type: 'node_completed',
         step_name: node.id,
-        data: { duration_ms: duration, type: 'bash' },
+        data: { duration_ms: duration, type: 'bash', node_output: output },
       })
       .catch((err: Error) => {
         getLog().error(
@@ -1244,8 +1334,654 @@ async function executeBashNode(
 }
 
 /**
+ * Build WorkflowAssistantOptions from workflow-level config.
+ * Loop nodes use workflow-level provider/model only; per-node overrides are not supported.
+ */
+function buildLoopNodeOptions(
+  provider: 'claude' | 'codex',
+  model: string | undefined,
+  config: WorkflowConfig
+): WorkflowAssistantOptions | undefined {
+  const codexOptions =
+    provider === 'codex'
+      ? {
+          modelReasoningEffort: config.assistants.codex.modelReasoningEffort,
+          webSearchMode: config.assistants.codex.webSearchMode,
+          additionalDirectories: config.assistants.codex.additionalDirectories,
+        }
+      : undefined;
+
+  const claudeOptions =
+    provider === 'claude' && config.assistants.claude.settingSources
+      ? { settingSources: config.assistants.claude.settingSources }
+      : undefined;
+
+  if (!model && !codexOptions && !claudeOptions) return undefined;
+  return { ...(model ? { model } : {}), ...codexOptions, ...claudeOptions };
+}
+
+/**
+ * Execute a loop node — runs prompt repeatedly until completion signal or max iterations.
+ *
+ * Key behaviors:
+ * - Returns NodeOutput (not void) — DAG executor owns workflow lifecycle
+ * - Receives upstream node outputs for $nodeId.output substitution
+ * - Does not write current_step_index (DAG tracks per-node completion)
+ */
+async function executeLoopNode(
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  cwd: string,
+  workflowRun: WorkflowRun,
+  node: LoopNode,
+  workflowProvider: 'claude' | 'codex',
+  workflowModel: string | undefined,
+  artifactsDir: string,
+  logDir: string,
+  baseBranch: string,
+  nodeOutputs: Map<string, NodeOutput>,
+  config: WorkflowConfig,
+  issueContext?: string
+): Promise<NodeOutput> {
+  const loop = node.loop;
+  const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
+
+  // Resolve AI client — fail fast with descriptive error
+  let aiClient: ReturnType<typeof deps.getAssistantClient>;
+  try {
+    aiClient = deps.getAssistantClient(workflowProvider);
+  } catch (error) {
+    const err = error as Error;
+    const errorMsg = `Invalid provider '${workflowProvider}' for loop node '${node.id}'. Check workflow YAML or .archon/config.yaml. Original: ${err.message}`;
+    getLog().error(
+      { err, nodeId: node.id, provider: workflowProvider },
+      'loop_node.provider_failed'
+    );
+    return { state: 'failed', output: '', error: errorMsg };
+  }
+
+  // Detect interactive loop resume — check if workflowRun.metadata has loop gate state for this node
+  const rawApproval = workflowRun.metadata?.approval;
+  const loopGateMeta = isApprovalContext(rawApproval) ? rawApproval : undefined;
+  const isLoopResume = loopGateMeta?.type === 'interactive_loop' && loopGateMeta.nodeId === node.id;
+  const startIteration = isLoopResume ? (loopGateMeta.iteration ?? 0) + 1 : 1;
+  let currentSessionId: string | undefined = isLoopResume ? loopGateMeta.sessionId : undefined;
+  const loopUserInput = isLoopResume
+    ? ((workflowRun.metadata?.loop_user_input as string | undefined) ?? '')
+    : '';
+
+  let lastIterationOutput = '';
+  const resolvedOptions = buildLoopNodeOptions(workflowProvider, workflowModel, config);
+
+  // Helper to log event store errors consistently
+  const logEventStoreError = (err: Error, iteration: number): void => {
+    getLog().error({ err, nodeId: node.id, iteration }, 'loop_node.iteration_event_failed');
+  };
+
+  for (let i = startIteration; i <= loop.max_iterations; i++) {
+    const iterationStart = Date.now();
+
+    // Check for non-running status between iterations (cancellation, deletion, or future: pause)
+    const runStatus = await deps.store.getWorkflowRunStatus(workflowRun.id);
+    if (runStatus === null || runStatus !== 'running') {
+      const effectiveStatus = runStatus ?? 'deleted';
+      getLog().info(
+        { workflowRunId: workflowRun.id, nodeId: node.id, iteration: i, status: effectiveStatus },
+        'loop_node.stop_detected'
+      );
+      await safeSendMessage(
+        platform,
+        conversationId,
+        `Loop node '${node.id}' stopped at iteration ${String(i)} (${effectiveStatus})`,
+        msgContext
+      );
+      return { state: 'failed', output: '', error: `Workflow ${effectiveStatus}` };
+    }
+
+    // Emit iteration started
+    getWorkflowEventEmitter().emit({
+      type: 'loop_iteration_started',
+      runId: workflowRun.id,
+      nodeId: node.id,
+      iteration: i,
+      maxIterations: loop.max_iterations,
+    });
+    deps.store
+      .createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'loop_iteration_started',
+        step_name: node.id,
+        data: { iteration: i, maxIterations: loop.max_iterations, nodeId: node.id },
+      })
+      .catch((err: Error) => {
+        logEventStoreError(err, i);
+      });
+
+    // Session threading
+    const needsFreshSession = loop.fresh_context || i === 1;
+    const resumeSessionId = needsFreshSession ? undefined : currentSessionId;
+
+    // Stream AI response for this iteration
+    let fullOutput = ''; // raw, for signal detection
+    let cleanOutput = ''; // stripped, for platform display
+    let iterationIdleTimedOut = false;
+    const iterationAbortController = new AbortController();
+
+    try {
+      // Build prompt — substituteWorkflowVariables throws if $BASE_BRANCH referenced but empty
+      // Pass loopUserInput on the first resumed iteration; '' on all others (non-interactive
+      // or subsequent iterations) so $LOOP_USER_INPUT substitutes to empty string explicitly.
+      const { prompt: substitutedPrompt } = substituteWorkflowVariables(
+        loop.prompt,
+        workflowRun.id,
+        workflowRun.user_message,
+        artifactsDir,
+        baseBranch,
+        issueContext,
+        i === startIteration ? loopUserInput : ''
+      );
+      const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
+
+      const iterationOptions: WorkflowAssistantOptions | undefined = {
+        ...resolvedOptions,
+        abortSignal: iterationAbortController.signal,
+      };
+
+      const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
+      let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
+
+      const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
+
+      for await (const msg of withIdleTimeout(generator, effectiveIdleTimeout, () => {
+        iterationIdleTimedOut = true;
+        getLog().warn(
+          { nodeId: node.id, iteration: i, timeoutMs: effectiveIdleTimeout },
+          'loop_node.idle_timeout_reached'
+        );
+        iterationAbortController.abort();
+      })) {
+        if (msg.type === 'assistant') {
+          fullOutput += msg.content;
+          const cleaned = stripCompletionTags(msg.content);
+          cleanOutput += cleaned;
+          if (platform.getStreamingMode() === 'stream' && cleaned) {
+            await safeSendMessage(platform, conversationId, cleaned, msgContext);
+          }
+          await logAssistant(logDir, workflowRun.id, msg.content);
+        } else if (msg.type === 'result') {
+          // Emit tool_completed for the last tool in the iteration
+          if (lastToolStartedAt) {
+            const prevTool = lastToolStartedAt;
+            getWorkflowEventEmitter().emit({
+              type: 'tool_completed',
+              runId: workflowRun.id,
+              toolName: prevTool.toolName,
+              stepName: node.id,
+              durationMs: Date.now() - prevTool.startedAt,
+            });
+            deps.store
+              .createWorkflowEvent({
+                workflow_run_id: workflowRun.id,
+                event_type: 'tool_completed',
+                step_name: node.id,
+                data: {
+                  tool_name: prevTool.toolName,
+                  duration_ms: Date.now() - prevTool.startedAt,
+                },
+              })
+              .catch((err: Error) => {
+                logEventStoreError(err, i);
+              });
+            lastToolStartedAt = null;
+          }
+          if (msg.sessionId) currentSessionId = msg.sessionId;
+          break; // Result is the "I'm done" signal — don't wait for subprocess to exit
+        } else if (msg.type === 'tool' && msg.toolName) {
+          const now = Date.now();
+
+          // Emit tool_completed for the previous tool
+          if (lastToolStartedAt) {
+            const prevTool = lastToolStartedAt;
+            getWorkflowEventEmitter().emit({
+              type: 'tool_completed',
+              runId: workflowRun.id,
+              toolName: prevTool.toolName,
+              stepName: node.id,
+              durationMs: now - prevTool.startedAt,
+            });
+            deps.store
+              .createWorkflowEvent({
+                workflow_run_id: workflowRun.id,
+                event_type: 'tool_completed',
+                step_name: node.id,
+                data: { tool_name: prevTool.toolName, duration_ms: now - prevTool.startedAt },
+              })
+              .catch((err: Error) => {
+                logEventStoreError(err, i);
+              });
+          }
+          lastToolStartedAt = { toolName: msg.toolName, startedAt: now };
+
+          // Emit tool_started for the current tool (fire-and-forget)
+          getWorkflowEventEmitter().emit({
+            type: 'tool_started',
+            runId: workflowRun.id,
+            toolName: msg.toolName,
+            stepName: node.id,
+          });
+
+          if (platform.getStreamingMode() === 'stream') {
+            const toolMsg = formatToolCall(msg.toolName, msg.toolInput);
+            if (toolMsg) {
+              await safeSendMessage(platform, conversationId, toolMsg, msgContext);
+            }
+            if (platform.sendStructuredEvent) {
+              await platform.sendStructuredEvent(conversationId, msg);
+            }
+          }
+
+          const toolInput: Record<string, unknown> = msg.toolInput
+            ? Object.fromEntries(
+                Object.entries(msg.toolInput).map(([k, v]) =>
+                  typeof v === 'string' && v.length > 500 ? [k, v.slice(0, 500) + '...'] : [k, v]
+                )
+              )
+            : {};
+          await logTool(logDir, workflowRun.id, msg.toolName, toolInput);
+
+          // Persist tool_called event
+          deps.store
+            .createWorkflowEvent({
+              workflow_run_id: workflowRun.id,
+              event_type: 'tool_called',
+              step_name: node.id,
+              data: { tool_name: msg.toolName, tool_input: toolInput },
+            })
+            .catch((err: Error) => {
+              logEventStoreError(err, i);
+            });
+        } else if (msg.type === 'tool_result' && platform.sendStructuredEvent) {
+          await platform.sendStructuredEvent(conversationId, msg);
+        }
+      }
+    } catch (error) {
+      const err = error as Error;
+      const duration = Date.now() - iterationStart;
+      getLog().error({ err, nodeId: node.id, iteration: i }, 'loop_node.iteration_failed');
+      getWorkflowEventEmitter().emit({
+        type: 'loop_iteration_failed',
+        runId: workflowRun.id,
+        nodeId: node.id,
+        iteration: i,
+        error: err.message,
+      });
+      deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'loop_iteration_failed',
+          step_name: node.id,
+          data: { iteration: i, error: err.message, duration, nodeId: node.id },
+        })
+        .catch((evtErr: Error) => {
+          logEventStoreError(evtErr, i);
+        });
+      return { state: 'failed', output: '', error: `Loop iteration ${i} failed: ${err.message}` };
+    }
+
+    // Notify on idle timeout
+    if (iterationIdleTimedOut) {
+      await safeSendMessage(
+        platform,
+        conversationId,
+        `Loop node '${node.id}' iteration ${String(i)} completed via idle timeout (no output for ${String((node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS) / 60000)} min)`,
+        msgContext
+      );
+    }
+
+    // Batch mode: send accumulated output
+    if (platform.getStreamingMode() === 'batch' && cleanOutput) {
+      await safeSendMessage(platform, conversationId, cleanOutput, msgContext);
+    }
+
+    lastIterationOutput = cleanOutput || fullOutput;
+
+    // Check LLM completion signal — the AI decides whether the user approved.
+    // For interactive loops, the AI emits the signal when the user explicitly approves
+    // (e.g., "approved", "looks good"). The prompt instructs the AI on when to emit it.
+    const signalDetected = detectCompletionSignal(fullOutput, loop.until);
+
+    // Check deterministic bash condition (if configured)
+    let bashComplete = false;
+    if (loop.until_bash) {
+      try {
+        const { prompt: bashPrompt } = substituteWorkflowVariables(
+          loop.until_bash,
+          workflowRun.id,
+          workflowRun.user_message,
+          artifactsDir,
+          baseBranch,
+          issueContext
+        );
+        const substitutedBash = substituteNodeOutputRefs(
+          bashPrompt,
+          nodeOutputs,
+          true // escapedForBash
+        );
+        await execFileAsync('bash', ['-c', substitutedBash], { cwd });
+        bashComplete = true; // exit 0 = complete
+      } catch (e) {
+        const bashErr = e as NodeJS.ErrnoException;
+        // ENOENT or other system errors are unexpected — log them
+        if (bashErr.code === 'ENOENT') {
+          getLog().warn(
+            { err: bashErr, nodeId: node.id, iteration: i },
+            'loop_node.until_bash_exec_error'
+          );
+        }
+        bashComplete = false; // non-zero exit = not complete
+      }
+    }
+
+    const duration = Date.now() - iterationStart;
+    const completionDetected = signalDetected || bashComplete;
+
+    // Emit iteration completed
+    getWorkflowEventEmitter().emit({
+      type: 'loop_iteration_completed',
+      runId: workflowRun.id,
+      nodeId: node.id,
+      iteration: i,
+      duration,
+      completionDetected,
+    });
+    deps.store
+      .createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'loop_iteration_completed',
+        step_name: node.id,
+        data: { iteration: i, duration, completionDetected, nodeId: node.id },
+      })
+      .catch((err: Error) => {
+        logEventStoreError(err, i);
+      });
+
+    await logNodeComplete(logDir, workflowRun.id, `${node.id}-iteration-${String(i)}`, node.id, {
+      durationMs: duration,
+    });
+
+    // Completion signal detected — exit the loop.
+    // For interactive loops: only honor the signal when the AI had user input to evaluate
+    // (i.e., this is a resume iteration with loopUserInput). On the first iteration of a
+    // fresh interactive loop, the user hasn't seen anything yet — always gate first.
+    // For non-interactive loops: the AI signals task completion at any point.
+    const interactiveFirstRun = loop.interactive && !isLoopResume;
+    if (completionDetected && !interactiveFirstRun) {
+      await safeSendMessage(
+        platform,
+        conversationId,
+        `Loop node '${node.id}' completed after ${String(i)} iteration${i > 1 ? 's' : ''}`,
+        msgContext
+      );
+      // Write node_completed event so resume logic (getCompletedDagNodeOutputs) knows this
+      // node is done. Without this, a resumed DAG would re-enter the loop node.
+      deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'node_completed',
+          step_name: node.id,
+          data: { duration_ms: Date.now() - iterationStart, node_output: lastIterationOutput },
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, eventType: 'node_completed' },
+            'workflow_event_persist_failed'
+          );
+        });
+      getWorkflowEventEmitter().emit({
+        type: 'node_completed',
+        runId: workflowRun.id,
+        nodeId: node.id,
+        nodeName: node.id,
+        duration: Date.now() - iterationStart,
+      });
+      return { state: 'completed', output: lastIterationOutput, sessionId: currentSessionId };
+    }
+
+    // Interactive loop gate — pause after every iteration where the AI did NOT emit the
+    // completion signal. The user reviews the AI's output and provides feedback or approval.
+    // On approval, the AI will emit the signal in the next iteration, exiting above.
+    if (loop.interactive && loop.gate_message) {
+      const gateMsg =
+        `\u23f8 **Input required** (loop \`${node.id}\`, iteration ${String(i)}): ${loop.gate_message}\n\n` +
+        `Run ID: \`${workflowRun.id}\`\n` +
+        `Respond: \`/workflow approve ${workflowRun.id} <your feedback>\` | Cancel: \`/workflow reject ${workflowRun.id}\``;
+      const gateSent = await safeSendMessage(platform, conversationId, gateMsg, {
+        workflowId: workflowRun.id,
+        nodeName: node.id,
+      });
+      if (!gateSent) {
+        // Gate message failed to deliver — do not pause; fail the node so the user
+        // sees a clear error rather than a silently orphaned paused run.
+        getLog().error(
+          { nodeId: node.id, workflowRunId: workflowRun.id, iteration: i },
+          'loop_node.gate_message_send_failed'
+        );
+        return {
+          state: 'failed',
+          output: lastIterationOutput,
+          error: `Loop gate message failed to deliver for node '${node.id}' — cannot pause safely`,
+        };
+      }
+      deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'approval_requested',
+          step_name: node.id,
+          data: { message: loop.gate_message, iteration: i },
+        })
+        .catch((err: Error) => {
+          logEventStoreError(err, i);
+        });
+      await deps.store.pauseWorkflowRun(workflowRun.id, {
+        nodeId: node.id,
+        message: loop.gate_message,
+        type: 'interactive_loop',
+        iteration: i,
+        sessionId: currentSessionId,
+      });
+      getWorkflowEventEmitter().emit({
+        type: 'approval_pending',
+        runId: workflowRun.id,
+        nodeId: node.id,
+        message: loop.gate_message,
+      });
+      // Return completed — the between-layer status check sees 'paused' and halts cleanly.
+      // This mirrors the approval-node pattern, preventing false "DAG nodes failed" warnings
+      // in multi-node workflows. Resume correctness relies on the 'paused' DB status, not
+      // on the node's output state.
+      return { state: 'completed', output: lastIterationOutput };
+    }
+  }
+
+  // Max iterations exceeded
+  const errorMsg = `Loop node '${node.id}' exceeded max iterations (${String(loop.max_iterations)}) without completion signal '${loop.until}'`;
+  getLog().warn(
+    { nodeId: node.id, maxIterations: loop.max_iterations, signal: loop.until },
+    'loop_node.max_iterations_reached'
+  );
+  await safeSendMessage(platform, conversationId, errorMsg, msgContext);
+  return { state: 'failed', output: lastIterationOutput, error: errorMsg };
+}
+
+/**
+ * Execute an approval node — pauses workflow for human review.
+ * On rejection resume (when on_reject is configured): runs the on_reject prompt via AI,
+ * then re-pauses at the approval gate. After max_attempts rejections, cancels normally.
+ */
+async function executeApprovalNode(
+  node: ApprovalNode,
+  workflowRun: WorkflowRun,
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  workflowProvider: 'claude' | 'codex',
+  workflowModel: string | undefined,
+  cwd: string,
+  artifactsDir: string,
+  logDir: string,
+  baseBranch: string,
+  nodeOutputs: Map<string, NodeOutput>,
+  config: WorkflowConfig,
+  configuredCommandFolder?: string,
+  issueContext?: string
+): Promise<NodeOutput> {
+  const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
+
+  // Detect rejection resume — check metadata for rejection_reason set by reject handlers
+  const rawApproval = workflowRun.metadata?.approval;
+  const approvalMeta = isApprovalContext(rawApproval) ? rawApproval : undefined;
+  const rawRejection = workflowRun.metadata?.rejection_reason;
+  const rejectionReason =
+    approvalMeta?.type === 'approval' &&
+    approvalMeta.nodeId === node.id &&
+    typeof rawRejection === 'string' &&
+    rawRejection !== ''
+      ? rawRejection
+      : '';
+
+  // On rejection resume with on_reject configured: run the on_reject prompt via AI
+  if (rejectionReason !== '' && node.approval.on_reject) {
+    const maxAttempts = node.approval.on_reject.max_attempts ?? 3;
+    const rejectionCount = (workflowRun.metadata?.rejection_count as number | undefined) ?? 0;
+
+    // Check if max attempts exhausted
+    if (rejectionCount >= maxAttempts) {
+      await deps.store.cancelWorkflowRun(workflowRun.id);
+      deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'workflow_cancelled',
+          step_name: node.id,
+          data: { reason: `max_attempts (${String(maxAttempts)}) exhausted` },
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, eventType: 'workflow_cancelled' },
+            'workflow.event_persist_failed'
+          );
+        });
+      getWorkflowEventEmitter().emit({
+        type: 'workflow_cancelled',
+        runId: workflowRun.id,
+        nodeId: node.id,
+        reason: `max_attempts (${String(maxAttempts)}) exhausted`,
+      });
+      const cancelMsg = `❌ Approval node \`${node.id}\` cancelled after ${String(maxAttempts)} rejections.`;
+      await safeSendMessage(platform, conversationId, cancelMsg, msgContext);
+      return { state: 'completed' as const, output: '' };
+    }
+
+    // Run the on_reject prompt via AI
+    const { prompt: substitutedPrompt } = substituteWorkflowVariables(
+      node.approval.on_reject.prompt,
+      workflowRun.id,
+      workflowRun.user_message ?? '',
+      artifactsDir,
+      baseBranch,
+      issueContext,
+      undefined, // loopUserInput
+      rejectionReason
+    );
+
+    // Build a synthetic PromptNode to reuse executeNodeInternal
+    const syntheticNode: PromptNode = {
+      id: node.id,
+      prompt: substituteNodeOutputRefs(substitutedPrompt, nodeOutputs),
+      ...(node.depends_on ? { depends_on: node.depends_on } : {}),
+      ...(node.idle_timeout ? { idle_timeout: node.idle_timeout } : {}),
+    };
+
+    const { provider, options: nodeOptions } = await resolveNodeProviderAndModel(
+      syntheticNode,
+      workflowProvider,
+      workflowModel,
+      config,
+      platform,
+      conversationId,
+      workflowRun.id,
+      cwd
+    );
+
+    const output = await executeNodeInternal(
+      deps,
+      platform,
+      conversationId,
+      cwd,
+      workflowRun,
+      syntheticNode,
+      provider,
+      nodeOptions,
+      artifactsDir,
+      logDir,
+      baseBranch,
+      nodeOutputs,
+      undefined, // fresh session
+      configuredCommandFolder,
+      issueContext
+    );
+
+    if (output.state === 'failed') {
+      return output;
+    }
+    // Fall through to re-pause at the approval gate
+  }
+
+  // Standard approval gate — send message and pause
+  const approvalMsg =
+    `⏸ **Approval required**: ${node.approval.message}\n\n` +
+    `Run ID: \`${workflowRun.id}\`\n` +
+    `Approve: \`/workflow approve ${workflowRun.id}\` | Reject: \`/workflow reject ${workflowRun.id}\``;
+  await safeSendMessage(platform, conversationId, approvalMsg, msgContext);
+
+  deps.store
+    .createWorkflowEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: 'approval_requested',
+      step_name: node.id,
+      data: { message: node.approval.message },
+    })
+    .catch((err: Error) => {
+      getLog().error(
+        { err, workflowRunId: workflowRun.id, eventType: 'approval_requested' },
+        'workflow.event_persist_failed'
+      );
+    });
+
+  await deps.store.pauseWorkflowRun(workflowRun.id, {
+    message: node.approval.message,
+    nodeId: node.id,
+    type: 'approval',
+    captureResponse: node.approval.capture_response,
+    onRejectPrompt: node.approval.on_reject?.prompt,
+    onRejectMaxAttempts: node.approval.on_reject?.max_attempts,
+  });
+
+  getWorkflowEventEmitter().emit({
+    type: 'approval_pending',
+    runId: workflowRun.id,
+    nodeId: node.id,
+    message: node.approval.message,
+  });
+
+  // Return completed — the between-layer status check will see 'paused' and break.
+  // On resume, the approve endpoint writes a real node_completed event with the user's response.
+  return { state: 'completed' as const, output: '' };
+}
+
+/**
  * Execute a complete DAG workflow.
- * Called from executeWorkflow() in executor.ts after isDagWorkflow() check.
+ * Called from executeWorkflow() in executor.ts.
  */
 export async function executeDagWorkflow(
   deps: WorkflowDeps,
@@ -1261,11 +1997,24 @@ export async function executeDagWorkflow(
   baseBranch: string,
   config: WorkflowConfig,
   configuredCommandFolder?: string,
-  issueContext?: string
-): Promise<void> {
+  issueContext?: string,
+  priorCompletedNodes?: Map<string, string>
+): Promise<string | undefined> {
   const dagStartTime = Date.now();
   const layers = buildTopologicalLayers(workflow.nodes);
   const nodeOutputs = new Map<string, NodeOutput>();
+
+  // Pre-populate nodeOutputs from prior run so already-completed nodes are
+  // treated as done for trigger-rule and $nodeId.output substitution purposes.
+  if (priorCompletedNodes && priorCompletedNodes.size > 0) {
+    for (const [nodeId, output] of priorCompletedNodes) {
+      nodeOutputs.set(nodeId, { state: 'completed', output });
+    }
+    getLog().info(
+      { workflowRunId: workflowRun.id, priorCompletedCount: priorCompletedNodes.size },
+      'dag.workflow_resume_prepopulated'
+    );
+  }
 
   getLog().info(
     {
@@ -1294,11 +2043,51 @@ export async function executeDagWorkflow(
     const layerResults = await Promise.allSettled(
       layer.map(async (node): Promise<{ nodeId: string; output: NodeOutput }> => {
         try {
+          // 0. Skip if this node completed successfully in a prior run (resume path)
+          if (priorCompletedNodes?.has(node.id)) {
+            getLog().info({ nodeId: node.id }, 'dag.node_skipped_prior_success');
+            await logNodeSkip(logDir, workflowRun.id, node.id, 'prior_success').catch(
+              (err: Error) => {
+                getLog().warn({ err, nodeId: node.id }, 'dag.node_skip_log_write_failed');
+              }
+            );
+            deps.store
+              .createWorkflowEvent({
+                workflow_run_id: workflowRun.id,
+                event_type: 'node_skipped_prior_success',
+                step_name: node.id,
+                data: { reason: 'prior_success' },
+              })
+              .catch((err: Error) => {
+                getLog().error(
+                  { err, workflowRunId: workflowRun.id, eventType: 'node_skipped_prior_success' },
+                  'workflow_event_persist_failed'
+                );
+              });
+            const emitterPrior = getWorkflowEventEmitter();
+            emitterPrior.emit({
+              type: 'node_skipped',
+              runId: workflowRun.id,
+              nodeId: node.id,
+              nodeName: node.command ?? node.id,
+              reason: 'prior_success',
+            });
+            // Return the pre-populated output (already in nodeOutputs)
+            return {
+              nodeId: node.id,
+              output: nodeOutputs.get(node.id) ?? { state: 'skipped' as const, output: '' },
+            };
+          }
+
           // 1. Evaluate trigger rule
           const triggerDecision = checkTriggerRule(node, nodeOutputs);
           if (triggerDecision === 'skip') {
             getLog().info({ nodeId: node.id, reason: 'trigger_rule' }, 'dag_node_skipped');
-            await logNodeSkip(logDir, workflowRun.id, node.id, 'trigger_rule');
+            await logNodeSkip(logDir, workflowRun.id, node.id, 'trigger_rule').catch(
+              (err: Error) => {
+                getLog().warn({ err, nodeId: node.id }, 'dag.node_skip_log_write_failed');
+              }
+            );
             deps.store
               .createWorkflowEvent({
                 workflow_run_id: workflowRun.id,
@@ -1330,7 +2119,7 @@ export async function executeDagWorkflow(
               nodeOutputs
             );
             if (!conditionParsed) {
-              const parseErrMsg = `\u26a0\ufe0f Node '${node.id}': unparseable \`when:\` expression "${node.when}" \u2014 node skipped (fail-closed). Check syntax: use \`$nodeId.output == 'VALUE'\`.`;
+              const parseErrMsg = `\u26a0\ufe0f Node '${node.id}': unparseable \`when:\` expression "${node.when}" \u2014 node skipped (fail-closed). Check syntax: \`$nodeId.output == 'VALUE'\`, \`$nodeId.output > '5'\`, or compound \`$a.output == 'X' && $b.output != 'Y'\`.`;
               await safeSendMessage(platform, conversationId, parseErrMsg, {
                 workflowId: workflowRun.id,
                 nodeName: node.id,
@@ -1339,7 +2128,14 @@ export async function executeDagWorkflow(
                 { nodeId: node.id, when: node.when },
                 'dag_node_skipped_condition_parse_error'
               );
-              await logNodeSkip(logDir, workflowRun.id, node.id, 'when_condition_parse_error');
+              await logNodeSkip(
+                logDir,
+                workflowRun.id,
+                node.id,
+                'when_condition_parse_error'
+              ).catch((err: Error) => {
+                getLog().warn({ err, nodeId: node.id }, 'dag.node_skip_log_write_failed');
+              });
               deps.store
                 .createWorkflowEvent({
                   workflow_run_id: workflowRun.id,
@@ -1365,7 +2161,11 @@ export async function executeDagWorkflow(
             }
             if (!conditionPasses) {
               getLog().info({ nodeId: node.id, when: node.when }, 'dag_node_skipped_condition');
-              await logNodeSkip(logDir, workflowRun.id, node.id, 'when_condition');
+              await logNodeSkip(logDir, workflowRun.id, node.id, 'when_condition').catch(
+                (err: Error) => {
+                  getLog().warn({ err, nodeId: node.id }, 'dag.node_skip_log_write_failed');
+                }
+              );
               deps.store
                 .createWorkflowEvent({
                   workflow_run_id: workflowRun.id,
@@ -1412,6 +2212,81 @@ export async function executeDagWorkflow(
             return { nodeId: node.id, output };
           }
 
+          // 3b. Loop node dispatch — manages its own AI sessions and iteration
+          if (isLoopNode(node)) {
+            const output = await executeLoopNode(
+              deps,
+              platform,
+              conversationId,
+              cwd,
+              workflowRun,
+              node,
+              workflowProvider,
+              workflowModel,
+              artifactsDir,
+              logDir,
+              baseBranch,
+              nodeOutputs,
+              config,
+              issueContext
+            );
+            return { nodeId: node.id, output };
+          }
+
+          // 3c. Approval node dispatch — pauses workflow for human review
+          if (isApprovalNode(node)) {
+            const output = await executeApprovalNode(
+              node,
+              workflowRun,
+              deps,
+              platform,
+              conversationId,
+              workflowProvider,
+              workflowModel,
+              cwd,
+              artifactsDir,
+              logDir,
+              baseBranch,
+              nodeOutputs,
+              config,
+              configuredCommandFolder,
+              issueContext
+            );
+            return { nodeId: node.id, output };
+          }
+
+          // 3d. Cancel node dispatch — terminates the workflow run
+          if (isCancelNode(node)) {
+            const reason = substituteNodeOutputRefs(node.cancel, nodeOutputs);
+            const cancelMsg = `\u274c **Workflow cancelled** (node \`${node.id}\`): ${reason}`;
+            await safeSendMessage(platform, conversationId, cancelMsg, {
+              workflowId: workflowRun.id,
+              nodeName: node.id,
+            });
+            deps.store
+              .createWorkflowEvent({
+                workflow_run_id: workflowRun.id,
+                event_type: 'workflow_cancelled',
+                step_name: node.id,
+                data: { reason },
+              })
+              .catch((err: Error) => {
+                getLog().error(
+                  { err, workflowRunId: workflowRun.id, eventType: 'workflow_cancelled' },
+                  'workflow.event_persist_failed'
+                );
+              });
+            await deps.store.cancelWorkflowRun(workflowRun.id);
+            getWorkflowEventEmitter().emit({
+              type: 'workflow_cancelled',
+              runId: workflowRun.id,
+              nodeId: node.id,
+              reason,
+            });
+            // Return completed — the between-layer status check will see 'cancelled' and break.
+            return { nodeId: node.id, output: { state: 'completed' as const, output: reason } };
+          }
+
           // 4. Resolve per-node provider/model/options
           const { provider, options: nodeOptions } = await resolveNodeProviderAndModel(
             node,
@@ -1425,6 +2300,8 @@ export async function executeDagWorkflow(
           );
 
           // 5. Determine session — parallel or context:fresh → always fresh
+          // Parallel layers always get fresh sessions; explicit 'fresh' context also forces it.
+          // 'shared' forces continuation. Default: fresh for parallel, inherited for sequential.
           const isFresh = isParallelLayer || node.context === 'fresh';
           const resumeSessionId = isFresh ? undefined : lastSequentialSessionId;
 
@@ -1446,8 +2323,9 @@ export async function executeDagWorkflow(
               logDir,
               baseBranch,
               nodeOutputs,
-              // Don't resume session on retry — start fresh
-              attempt > 0 ? undefined : resumeSessionId,
+              // Always pass the prior session ID — forkSession:true in executeNodeInternal
+              // ensures the source is never mutated, so retries can safely resume from it.
+              resumeSessionId,
               configuredCommandFolder,
               issueContext
             );
@@ -1553,31 +2431,60 @@ export async function executeDagWorkflow(
       getLog().warn({ layerIdx, nodeCount: layer.length }, 'dag_layer_had_failures');
     }
 
-    // Check for cancellation between DAG layers
+    // Check for non-running status between DAG layers (cancellation, deletion, pause)
     try {
       const dagStatus = await deps.store.getWorkflowRunStatus(workflowRun.id);
-      if (dagStatus === 'cancelled') {
+      if (dagStatus === null || dagStatus !== 'running') {
+        const effectiveStatus = dagStatus ?? 'deleted';
         getLog().info(
-          { workflowRunId: workflowRun.id, layerIdx, totalLayers: layers.length },
-          'dag.cancel_detected_between_layers'
+          {
+            workflowRunId: workflowRun.id,
+            layerIdx,
+            totalLayers: layers.length,
+            status: effectiveStatus,
+          },
+          'dag.stop_detected_between_layers'
         );
-        await safeSendMessage(
-          platform,
-          conversationId,
-          `⚠️ **Workflow cancelled**: DAG execution stopped after layer ${String(layerIdx + 1)}/${String(layers.length)}`,
-          { workflowId: workflowRun.id }
-        );
+        // Paused is intentional (approval gate) — the approval message was already sent
+        if (effectiveStatus !== 'paused') {
+          await safeSendMessage(
+            platform,
+            conversationId,
+            `⚠️ **Workflow stopped** (${effectiveStatus}): DAG execution stopped after layer ${String(layerIdx + 1)}/${String(layers.length)}`,
+            { workflowId: workflowRun.id }
+          );
+        }
         break;
       }
-    } catch (cancelErr) {
-      // Non-fatal — cancel check failure should not crash the workflow
-      getLog().warn({ err: cancelErr as Error }, 'dag.cancel_check_failed');
+    } catch (statusErr) {
+      // Non-fatal — status check failure should not crash the workflow
+      getLog().warn(
+        { err: statusErr as Error, workflowRunId: workflowRun.id },
+        'dag.status_check_failed'
+      );
     }
   }
 
-  // Determine workflow success: at least one node completed (not all failed/skipped)
-  const anyCompleted = [...nodeOutputs.values()].some(o => o.state === 'completed');
-  const anyFailed = [...nodeOutputs.values()].some(o => o.state === 'failed');
+  // Helper: bail out if the run was transitioned externally (cancelled, deleted, etc.)
+  async function skipIfStatusChanged(logEvent: string): Promise<boolean> {
+    const status = await deps.store.getWorkflowRunStatus(workflowRun.id);
+    if (status === null || status !== 'running') {
+      getLog().info({ workflowRunId: workflowRun.id, status: status ?? 'deleted' }, logEvent);
+      getWorkflowEventEmitter().unregisterRun(workflowRun.id);
+      return true;
+    }
+    return false;
+  }
+
+  // Single-pass: compute node outcome counts and derive success/failure booleans
+  const nodeCounts = { completed: 0, failed: 0, skipped: 0, total: workflow.nodes.length };
+  for (const o of nodeOutputs.values()) {
+    if (o.state === 'completed') nodeCounts.completed++;
+    else if (o.state === 'failed') nodeCounts.failed++;
+    else if (o.state === 'skipped') nodeCounts.skipped++;
+  }
+  const anyCompleted = nodeCounts.completed > 0;
+  const anyFailed = nodeCounts.failed > 0;
 
   getLog().info(
     { nodeCount: workflow.nodes.length, anyCompleted, anyFailed },
@@ -1585,20 +2492,27 @@ export async function executeDagWorkflow(
   );
 
   if (!anyCompleted) {
+    if (await skipIfStatusChanged('dag.skip_fail_status_changed')) return;
     const failMsg =
       `DAG workflow '${workflow.name}' completed with no successful nodes. ` +
       'Check node conditions, trigger rules, and upstream failures.';
+    // Note: nodeCounts not stored for failed runs — failWorkflowRun only stores { error }.
+    // Frontend guards with isValidNodeCounts so missing node_counts is safe.
     await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
       getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
     });
-    await logWorkflowError(logDir, workflowRun.id, failMsg);
+    await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
+      getLog().error(
+        { err: logErr, workflowRunId: workflowRun.id },
+        'dag.workflow_error_log_write_failed'
+      );
+    });
     const emitterForFail = getWorkflowEventEmitter();
     emitterForFail.emit({
       type: 'workflow_failed',
       runId: workflowRun.id,
       workflowName: workflow.name,
       error: failMsg,
-      stepIndex: 0,
     });
     emitterForFail.unregisterRun(workflowRun.id);
     await safeSendMessage(platform, conversationId, `\u274c ${failMsg}`, {
@@ -1621,9 +2535,12 @@ export async function executeDagWorkflow(
     );
   }
 
+  // Check if status was changed externally (e.g. cancelled) before marking complete.
+  if (await skipIfStatusChanged('dag.skip_complete_status_changed')) return;
+
   // Update DB and emit completion
   try {
-    await deps.store.completeWorkflowRun(workflowRun.id);
+    await deps.store.completeWorkflowRun(workflowRun.id, { node_counts: nodeCounts });
   } catch (dbErr) {
     getLog().error(
       { err: dbErr as Error, workflowRunId: workflowRun.id },
@@ -1658,4 +2575,15 @@ export async function executeDagWorkflow(
       );
     });
   emitter.unregisterRun(workflowRun.id);
+
+  // Return the first terminal node's output (nodes with no dependents) for the parent
+  // conversation summary. For the common single-terminal case this is unambiguous; for
+  // multi-terminal DAGs the first completed node in definition order is used.
+  const allDependencies = new Set(workflow.nodes.flatMap(n => n.depends_on ?? []));
+  const terminalOutput = workflow.nodes
+    .filter(n => !allDependencies.has(n.id))
+    .map(n => nodeOutputs.get(n.id))
+    .find(o => o?.state === 'completed' && o.output.trim().length > 0)?.output;
+
+  return terminalOutput;
 }

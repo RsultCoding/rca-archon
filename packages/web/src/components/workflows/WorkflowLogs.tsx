@@ -15,6 +15,10 @@ interface WorkflowLogsProps {
   isRunning?: boolean;
   currentlyExecuting?: { nodeName: string; startedAt: number } | null;
   toolEvents?: ToolEvent[];
+  /** Timestamp of the selected node's start — used to scroll the message list. */
+  scrollToNodeTimestamp?: number | null;
+  /** Incremented on every user node click to trigger scroll. */
+  nodeScrollTrigger?: number;
 }
 
 function hydrateMessages(
@@ -176,6 +180,8 @@ export function WorkflowLogs({
   isRunning,
   currentlyExecuting,
   toolEvents,
+  scrollToNodeTimestamp,
+  nodeScrollTrigger,
 }: WorkflowLogsProps): React.ReactElement {
   const [sseMessages, setSseMessages] = useState<ChatMessage[]>([]);
   const queryClient = useQueryClient();
@@ -197,8 +203,6 @@ export function WorkflowLogs({
 
   // Poll for messages from DB — 3s while running (or during grace period), disabled when terminal.
   // staleTime: 0 ensures post-completion navigation always fetches fresh data on mount.
-  // Tool calls are read from message metadata directly (not from toolEvents prop),
-  // so we don't need toolEvents?.length in the query key — avoids unnecessary re-fetches.
   const { data: queryMessages } = useQuery({
     queryKey: ['workflowMessages', conversationId],
     queryFn: async (): Promise<ChatMessage[]> => {
@@ -214,10 +218,28 @@ export function WorkflowLogs({
   // Also force-scroll to bottom so the user sees the final output.
   useEffect(() => {
     if (prevIsRunningRef.current && !isRunning) {
+      // Finalize any in-flight SSE tool calls that never received tool_result.
+      // This is a safety net for when onLockChange fires late or is missed.
+      const now = Date.now();
+      setSseMessages(prev =>
+        prev.map(msg => {
+          const hasOpenTool = msg.toolCalls?.some(tc => tc.duration === undefined && !tc.output);
+          if (!hasOpenTool && !msg.isStreaming) return msg;
+          return {
+            ...msg,
+            isStreaming: false,
+            toolCalls: msg.toolCalls?.map(tc =>
+              tc.duration === undefined && !tc.output ? { ...tc, duration: now - tc.startedAt } : tc
+            ),
+          };
+        })
+      );
+
       setGracePolling(true);
       setScrollTrigger(prev => prev + 1);
       const timer = setTimeout(() => {
         setGracePolling(false);
+        // Final invalidation to pick up late DB flushes
         void queryClient.invalidateQueries({ queryKey: ['workflowMessages', conversationId] });
         setScrollTrigger(prev => prev + 1);
       }, 6000);
@@ -300,7 +322,73 @@ export function WorkflowLogs({
     const isInDb = (name: string, duration: number): boolean =>
       dbTools.some(dt => dt.name === name && Math.abs(dt.duration - duration) < 500);
 
-    // Strip SSE tool calls that already appear in DB messages.
+    // Collect in-flight SSE tool counts (tool_call received, tool_result not yet received).
+    // These are tools SSE is actively tracking with a running spinner.
+    // Uses a counted map (not a Set) to handle concurrent same-name tools (e.g., parallel Read calls).
+    const sseInFlightCounts = new Map<string, number>();
+    for (const m of sseMessages) {
+      for (const tc of m.toolCalls ?? []) {
+        if (tc.duration === undefined && !tc.output) {
+          sseInFlightCounts.set(tc.name, (sseInFlightCounts.get(tc.name) ?? 0) + 1);
+        }
+      }
+    }
+
+    // Handle in-flight DB tool calls to prevent duplicates and ordering glitches.
+    // When a tool is in-flight, workflow_events has a tool_called row (no duration yet),
+    // which hydrateMessages surfaces into queryMessages. Without handling, that DB
+    // entry and the SSE entry both appear — the race condition described in issue #744.
+    //
+    // Two strategies applied:
+    // 1. SUPPRESS in-flight DB tools that SSE is actively tracking (cardinality-aware)
+    // 2. REPOSITION remaining in-flight DB tools to sort at the end (timestamp bump)
+    //    This prevents the ordering glitch where DB's earlier server timestamp causes
+    //    in-flight tools to jump above completed SSE tools during the prune timing gap.
+    const now = Date.now();
+    let filteredDbMessages: ChatMessage[];
+    if (sseInFlightCounts.size > 0 || isRunning) {
+      const dbSuppressedCounts = new Map<string, number>();
+      const mapped = dbMessages.map(m => {
+        if (!m.toolCalls?.length) return m; // No tool calls to filter — return as-is
+        let messageChanged = false;
+        const filteredTools = m.toolCalls.filter(tc => {
+          if (tc.duration !== undefined || !!tc.output) return true;
+          // In-flight DB tool — suppress if SSE is actively tracking one with this name
+          if (sseInFlightCounts.size > 0) {
+            const limit = sseInFlightCounts.get(tc.name) ?? 0;
+            const suppressed = dbSuppressedCounts.get(tc.name) ?? 0;
+            if (suppressed < limit) {
+              dbSuppressedCounts.set(tc.name, suppressed + 1);
+              return false; // SSE owns this tool's live display
+            }
+          }
+          // In-flight DB tool NOT tracked by SSE — keep it visible but flag for
+          // timestamp bump so it sorts at the end instead of jumping above completed tools
+          messageChanged = true;
+          return true;
+        });
+        if (filteredTools.length === 0) {
+          return { ...m, toolCalls: undefined };
+        }
+        if (filteredTools.length !== m.toolCalls.length) {
+          // Some tools were suppressed. If remaining tools include unsuppressed
+          // in-flight ones, bump timestamp so they sort at the end (REPOSITION).
+          return { ...m, toolCalls: filteredTools, ...(messageChanged ? { timestamp: now } : {}) };
+        }
+        // No tools suppressed — if this message has in-flight tools, bump its
+        // timestamp so it sorts at the end (matching where SSE would place it)
+        if (messageChanged) {
+          return { ...m, timestamp: now };
+        }
+        return m;
+      });
+      // Preserve memo stability: return original array if nothing was actually filtered
+      filteredDbMessages = mapped.every((m, i) => m === dbMessages[i]) ? dbMessages : mapped;
+    } else {
+      filteredDbMessages = dbMessages;
+    }
+
+    // Strip SSE tool calls that already appear in DB messages (completed).
     const dedupedSse: ChatMessage[] = [];
     for (const m of sseMessages) {
       if (!m.toolCalls?.length) {
@@ -318,8 +406,8 @@ export function WorkflowLogs({
       }
     }
 
-    if (dedupedSse.length === 0) return dbMessages;
-    const combined = [...dbMessages, ...dedupedSse];
+    if (dedupedSse.length === 0) return filteredDbMessages;
+    const combined = [...filteredDbMessages, ...dedupedSse];
     combined.sort((a, b) => a.timestamp - b.timestamp);
     return combined;
   }, [queryMessages, sseMessages, isRunning, gracePolling]);
@@ -509,6 +597,8 @@ export function WorkflowLogs({
         messages={displayMessages}
         isStreaming={isStreaming}
         scrollTrigger={scrollTrigger}
+        scrollToTimestamp={scrollToNodeTimestamp}
+        scrollToTrigger={nodeScrollTrigger}
       />
     </div>
   );

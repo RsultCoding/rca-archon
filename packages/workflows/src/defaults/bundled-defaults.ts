@@ -35,20 +35,22 @@ import archonValidatePrE2eMainCmd from '../../../../.archon/commands/defaults/ar
 import archonValidatePrReportCmd from '../../../../.archon/commands/defaults/archon-validate-pr-report.md' with { type: 'text' };
 
 // =============================================================================
-// Default Workflows (10 total)
+// Default Workflows (13 total)
 // =============================================================================
 
 import archonAssistWf from '../../../../.archon/workflows/defaults/archon-assist.yaml' with { type: 'text' };
 import archonComprehensivePrReviewWf from '../../../../.archon/workflows/defaults/archon-comprehensive-pr-review.yaml' with { type: 'text' };
+import archonCreateIssueWf from '../../../../.archon/workflows/defaults/archon-create-issue.yaml' with { type: 'text' };
 import archonFeatureDevelopmentWf from '../../../../.archon/workflows/defaults/archon-feature-development.yaml' with { type: 'text' };
 import archonFixGithubIssueWf from '../../../../.archon/workflows/defaults/archon-fix-github-issue.yaml' with { type: 'text' };
-import archonRalphFreshWf from '../../../../.archon/workflows/defaults/archon-ralph-fresh.yaml' with { type: 'text' };
-import archonRalphStatefulWf from '../../../../.archon/workflows/defaults/archon-ralph-stateful.yaml' with { type: 'text' };
 import archonResolveConflictsWf from '../../../../.archon/workflows/defaults/archon-resolve-conflicts.yaml' with { type: 'text' };
 import archonSmartPrReviewWf from '../../../../.archon/workflows/defaults/archon-smart-pr-review.yaml' with { type: 'text' };
-import archonTestLoopWf from '../../../../.archon/workflows/defaults/archon-test-loop.yaml' with { type: 'text' };
 import archonValidatePrWf from '../../../../.archon/workflows/defaults/archon-validate-pr.yaml' with { type: 'text' };
 import archonRemotionGenerateWf from '../../../../.archon/workflows/defaults/archon-remotion-generate.yaml' with { type: 'text' };
+import archonInteractivePrdWf from '../../../../.archon/workflows/defaults/archon-interactive-prd.yaml' with { type: 'text' };
+import archonPivLoopWf from '../../../../.archon/workflows/defaults/archon-piv-loop.yaml' with { type: 'text' };
+import archonAdversarialDevWf from '../../../../.archon/workflows/defaults/archon-adversarial-dev.yaml' with { type: 'text' };
+import archonWorkflowBuilderWf from '../../../../.archon/workflows/defaults/archon-workflow-builder.yaml' with { type: 'text' };
 
 // =============================================================================
 // Exports
@@ -87,21 +89,36 @@ export const BUNDLED_COMMANDS: Record<string, string> = {
 export const BUNDLED_WORKFLOWS: Record<string, string> = {
   'archon-assist': archonAssistWf,
   'archon-comprehensive-pr-review': archonComprehensivePrReviewWf,
+  'archon-create-issue': archonCreateIssueWf,
   'archon-feature-development': archonFeatureDevelopmentWf,
   'archon-fix-github-issue': archonFixGithubIssueWf,
-  'archon-ralph-fresh': archonRalphFreshWf,
-  'archon-ralph-stateful': archonRalphStatefulWf,
   'archon-resolve-conflicts': archonResolveConflictsWf,
   'archon-smart-pr-review': archonSmartPrReviewWf,
-  'archon-test-loop': archonTestLoopWf,
   'archon-validate-pr': archonValidatePrWf,
   'archon-remotion-generate': archonRemotionGenerateWf,
+  'archon-interactive-prd': archonInteractivePrdWf,
+  'archon-piv-loop': archonPivLoopWf,
+  'archon-adversarial-dev': archonAdversarialDevWf,
+  'archon-workflow-builder': archonWorkflowBuilderWf,
 };
 
 /**
- * Check if the current process is running as a compiled binary (not via Bun)
- * When running as a binary, process.execPath won't contain 'bun'
+ * Check if a given module directory path belongs to a compiled Bun binary.
+ *
+ * Compiled Bun binaries use a virtual filesystem for bundled modules:
+ * - Linux/macOS: `/$bunfs/root/`
+ * - Windows: `B:\~BUN\root\` or `B:/~BUN/root/`
+ */
+export function isBunVirtualFs(dir: string): boolean {
+  return dir.startsWith('/$bunfs/') || dir.startsWith('B:\\~BUN\\') || dir.startsWith('B:/~BUN/');
+}
+
+/**
+ * Check if the current process is running as a compiled binary (not via Bun CLI).
+ *
+ * Note: `process.versions.bun` is still set in compiled binaries as of Bun 1.3.5,
+ * so we use the virtual filesystem path prefix for detection instead.
  */
 export function isBinaryBuild(): boolean {
-  return !process.execPath.toLowerCase().includes('bun');
+  return isBunVirtualFs(import.meta.dir);
 }

@@ -1,69 +1,29 @@
-import { memo, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { ArrowDown, Sparkles, ArrowRight, MessageSquare } from 'lucide-react';
-import { useQuery } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { MessageBubble } from './MessageBubble';
 import { ToolCallCard } from './ToolCallCard';
 import { ErrorCard } from './ErrorCard';
+import { WorkflowProgressCard } from './WorkflowProgressCard';
 import { useAutoScroll } from '@/hooks/useAutoScroll';
-import { getWorkflowRunByWorker } from '@/lib/api';
 import type { ChatMessage } from '@/lib/types';
 
-function WorkflowDispatchInline({
-  workflowName,
-  workerConversationId,
-}: {
-  workflowName: string;
-  workerConversationId: string;
-}): React.ReactElement {
-  const navigate = useNavigate();
-
-  const { data: runData, isError: isErrorRunData } = useQuery({
-    queryKey: ['workflowRunByWorker', workerConversationId],
-    queryFn: () => getWorkflowRunByWorker(workerConversationId),
-    refetchInterval: (query): number | false => {
-      const status = query.state.data?.run.status;
-      if (status === 'completed' || status === 'failed' || status === 'cancelled') return false;
-      return 3000;
-    },
-  });
-
-  const status = runData?.run.status;
-
-  const handleClick = (): void => {
-    if (runData?.run.id) {
-      navigate(`/workflows/runs/${runData.run.id}`);
-    } else {
-      navigate(`/chat/${encodeURIComponent(workerConversationId)}`);
-    }
-  };
-
-  const statusIcon = isErrorRunData ? (
-    <span className="text-error text-xs shrink-0">&#x26A0;</span>
-  ) : status === 'completed' ? (
-    <span className="text-success text-xs shrink-0">&#x2713;</span>
-  ) : status === 'failed' ? (
-    <span className="text-error text-xs shrink-0">&#x2717;</span>
-  ) : status === 'cancelled' ? (
-    <span className="text-text-secondary text-xs shrink-0">&#x2715;</span>
-  ) : (
-    <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-accent border-t-transparent shrink-0" />
-  );
-
-  return (
-    <button
-      onClick={handleClick}
-      className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2 text-xs transition-colors hover:bg-surface-elevated hover:border-primary/50 text-left max-w-sm"
+// Hoisted to module scope to prevent new references on every render
+const WORKFLOW_RESULT_MARKDOWN_COMPONENTS = {
+  a: ({ children, ...props }: React.ComponentPropsWithoutRef<'a'>): React.ReactElement => (
+    <a
+      className="text-primary underline decoration-primary/40 hover:decoration-primary"
+      target="_blank"
+      rel="noopener noreferrer"
+      {...props}
     >
-      {statusIcon}
-      <span className="truncate text-text-primary font-medium">{workflowName}</span>
-      <span className="text-primary font-medium shrink-0">View &rarr;</span>
-    </button>
-  );
-}
+      {children}
+    </a>
+  ),
+};
 
 function WorkflowResultCard({
   workflowName,
@@ -104,7 +64,12 @@ function WorkflowResultCard({
       </div>
       <div className="px-3 py-2">
         <div className="chat-markdown text-xs text-text-secondary">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayContent}</ReactMarkdown>
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={WORKFLOW_RESULT_MARKDOWN_COMPONENTS}
+          >
+            {displayContent}
+          </ReactMarkdown>
         </div>
         {isTruncatable && (
           <button
@@ -126,6 +91,10 @@ interface MessageListProps {
   isStreaming: boolean;
   /** When this value changes, force-scroll to bottom regardless of user scroll position. */
   scrollTrigger?: number;
+  /** Scroll to the first message at or after this timestamp. */
+  scrollToTimestamp?: number | null;
+  /** Increment to re-trigger scroll even if scrollToTimestamp didn't change (e.g. clicking same node). */
+  scrollToTrigger?: number;
   /** When true, show welcoming empty state instead of generic placeholder. */
   isNewChat?: boolean;
   /** Project name to display as context in the welcoming view. */
@@ -138,6 +107,8 @@ function MessageListRaw({
   messages,
   isStreaming,
   scrollTrigger,
+  scrollToTimestamp,
+  scrollToTrigger,
   isNewChat,
   projectName,
   onQuickAction,
@@ -149,6 +120,28 @@ function MessageListRaw({
     [messages, isStreaming],
     scrollTrigger
   );
+
+  // Scroll to a specific message by timestamp (e.g., when user clicks a DAG node).
+  // Only fires on user-initiated clicks (scrollToTrigger > 0), not on mount/auto-select.
+  useEffect(() => {
+    if (scrollToTimestamp == null || !scrollToTrigger || !containerRef.current) return;
+    const raf = requestAnimationFrame(() => {
+      if (!containerRef.current) return;
+      const elements = containerRef.current.querySelectorAll<HTMLElement>('[data-timestamp]');
+      let target: HTMLElement | null = null;
+      for (const el of elements) {
+        const ts = Number(el.getAttribute('data-timestamp'));
+        if (ts >= scrollToTimestamp) {
+          target = el;
+          break;
+        }
+      }
+      target?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+    return (): void => {
+      cancelAnimationFrame(raf);
+    };
+  }, [scrollToTimestamp, scrollToTrigger]);
 
   if (messages.length === 0) {
     if (isNewChat) {
@@ -201,31 +194,47 @@ function MessageListRaw({
     <div className="relative flex-1 overflow-hidden">
       <div ref={containerRef} className="h-full overflow-y-auto px-4 py-4">
         <div className="mx-auto flex max-w-3xl flex-col gap-3 pb-6">
-          {messages.map(msg => (
-            <div key={msg.id} className="flex flex-col gap-1.5">
-              {msg.workflowResult ? (
-                <WorkflowResultCard
-                  workflowName={msg.workflowResult.workflowName}
-                  runId={msg.workflowResult.runId}
-                  content={msg.content}
-                />
-              ) : (
-                <>
-                  <MessageBubble message={msg} />
-                  {msg.toolCalls?.map(tool => (
-                    <ToolCallCard key={tool.id} tool={tool} />
-                  ))}
-                  {msg.error && <ErrorCard error={msg.error} />}
-                  {msg.workflowDispatch && (
-                    <WorkflowDispatchInline
-                      workflowName={msg.workflowDispatch.workflowName}
-                      workerConversationId={msg.workflowDispatch.workerConversationId}
-                    />
-                  )}
-                </>
-              )}
-            </div>
-          ))}
+          {messages.map(msg =>
+            msg.role === 'system' ? (
+              <div
+                key={msg.id}
+                data-timestamp={String(msg.timestamp)}
+                className="flex items-center justify-center gap-2 py-1 text-xs text-muted-foreground"
+              >
+                <span className="h-px flex-1 bg-border" />
+                <span>{msg.content}</span>
+                <span className="h-px flex-1 bg-border" />
+              </div>
+            ) : (
+              <div
+                key={msg.id}
+                data-timestamp={String(msg.timestamp)}
+                className="flex flex-col gap-1.5"
+              >
+                {msg.workflowResult ? (
+                  <WorkflowResultCard
+                    workflowName={msg.workflowResult.workflowName}
+                    runId={msg.workflowResult.runId}
+                    content={msg.content}
+                  />
+                ) : (
+                  <>
+                    <MessageBubble message={msg} />
+                    {msg.toolCalls?.map(tool => (
+                      <ToolCallCard key={tool.id} tool={tool} />
+                    ))}
+                    {msg.error && <ErrorCard error={msg.error} />}
+                    {msg.workflowDispatch && (
+                      <WorkflowProgressCard
+                        workflowName={msg.workflowDispatch.workflowName}
+                        workerConversationId={msg.workflowDispatch.workerConversationId}
+                      />
+                    )}
+                  </>
+                )}
+              </div>
+            )
+          )}
         </div>
       </div>
 

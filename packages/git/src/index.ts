@@ -24,7 +24,6 @@ export {
   isWorktreePath,
   removeWorktree,
   getCanonicalRepoPath,
-  createWorktreeForIssue,
 } from './worktree';
 
 // Branch operations
@@ -34,6 +33,7 @@ export {
   hasUncommittedChanges,
   commitAllChanges,
   isBranchMerged,
+  isAncestorOf,
   getLastCommitDate,
 } from './branch';
 

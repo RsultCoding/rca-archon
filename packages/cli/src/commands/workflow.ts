@@ -1,21 +1,32 @@
 /**
  * Workflow command - list and run workflows
  */
-import { registerRepository, loadConfig, loadRepoConfig, generateAndSetTitle } from '@archon/core';
-import { configureIsolation, getIsolationProvider } from '@archon/isolation';
-import { createLogger } from '@archon/paths';
-import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
 import {
-  discoverWorkflowsWithConfig,
-  executeWorkflow,
-  type WorkflowLoadResult,
-} from '@archon/workflows';
+  registerRepository,
+  loadConfig,
+  loadRepoConfig,
+  generateAndSetTitle,
+  createWorkflowStore,
+} from '@archon/core';
+import { WORKFLOW_EVENT_TYPES, type WorkflowEventType } from '@archon/workflows/store';
+import { configureIsolation, getIsolationProvider } from '@archon/isolation';
+import { createLogger, getArchonHome } from '@archon/paths';
+import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
+import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
+import { executeWorkflow } from '@archon/workflows/executor';
+import type { WorkflowLoadResult } from '@archon/workflows/schemas/workflow';
+import type { WorkflowRun, ApprovalContext } from '@archon/workflows/schemas/workflow-run';
+import {
+  TERMINAL_WORKFLOW_STATUSES,
+  RESUMABLE_WORKFLOW_STATUSES,
+} from '@archon/workflows/schemas/workflow-run';
 import * as conversationDb from '@archon/core/db/conversations';
 import * as codebaseDb from '@archon/core/db/codebases';
 import * as isolationDb from '@archon/core/db/isolation-environments';
 import * as messageDb from '@archon/core/db/messages';
 import * as workflowDb from '@archon/core/db/workflows';
-import { getDatabase } from '@archon/core/db/connection';
+import * as workflowEventsDb from '@archon/core/db/workflow-events';
+import type { WorkflowEventRow } from '@archon/core/db/workflow-events';
 import * as git from '@archon/git';
 import { CLIAdapter } from '../adapters/cli-adapter';
 
@@ -42,6 +53,7 @@ export interface WorkflowRunOptions {
   fromBranch?: string;
   noWorktree?: boolean;
   resume?: boolean;
+  codebaseId?: string; // Passed by resume/approve to skip path-based lookup
 }
 
 /**
@@ -59,7 +71,9 @@ function generateConversationId(): string {
  */
 async function loadWorkflows(cwd: string): Promise<WorkflowLoadResult> {
   try {
-    return await discoverWorkflowsWithConfig(cwd, loadConfig);
+    return await discoverWorkflowsWithConfig(cwd, loadConfig, {
+      globalSearchPath: getArchonHome(),
+    });
   } catch (error) {
     const err = error as Error;
     throw new Error(
@@ -81,11 +95,11 @@ interface WorkflowJsonEntry {
  * List available workflows in the current directory
  */
 export async function workflowListCommand(cwd: string, json?: boolean): Promise<void> {
-  const { workflows, errors } = await loadWorkflows(cwd);
+  const { workflows: workflowEntries, errors } = await loadWorkflows(cwd);
 
   if (json) {
     const output = {
-      workflows: workflows.map(w => {
+      workflows: workflowEntries.map(({ workflow: w }) => {
         const entry: WorkflowJsonEntry = {
           name: w.name,
           description: w.description,
@@ -109,16 +123,16 @@ export async function workflowListCommand(cwd: string, json?: boolean): Promise<
 
   console.log(`Discovering workflows in: ${cwd}`);
 
-  if (workflows.length === 0 && errors.length === 0) {
+  if (workflowEntries.length === 0 && errors.length === 0) {
     console.log('\nNo workflows found.');
     console.log('Workflows should be in .archon/workflows/ directory.');
     return;
   }
 
-  if (workflows.length > 0) {
-    console.log(`\nFound ${String(workflows.length)} workflow(s):\n`);
+  if (workflowEntries.length > 0) {
+    console.log(`\nFound ${String(workflowEntries.length)} workflow(s):\n`);
 
-    for (const workflow of workflows) {
+    for (const { workflow } of workflowEntries) {
       console.log(`  ${workflow.name}`);
       console.log(`    ${workflow.description}`);
       if (workflow.provider) {
@@ -146,11 +160,13 @@ export async function workflowRunCommand(
   userMessage: string,
   options: WorkflowRunOptions = {}
 ): Promise<void> {
-  const { workflows, errors } = await loadWorkflows(cwd);
+  const { workflows: workflowEntries, errors } = await loadWorkflows(cwd);
 
-  if (workflows.length === 0 && errors.length === 0) {
+  if (workflowEntries.length === 0 && errors.length === 0) {
     throw new Error('No workflows found in .archon/workflows/');
   }
+
+  const workflows = workflowEntries.map(ws => ws.workflow);
 
   // Find the requested workflow (exact match first, then case-insensitive)
   let workflow = workflows.find(w => w.name === workflowName);
@@ -162,6 +178,38 @@ export async function workflowRunCommand(
         'workflow_run_case_insensitive_match'
       );
       workflow = caseMatch;
+    }
+  }
+
+  // 3. Suffix match (e.g., "assist" matches "archon-assist")
+  if (!workflow) {
+    const lowerName = workflowName.toLowerCase();
+    const suffixMatches = workflows.filter(w => w.name.toLowerCase().endsWith(`-${lowerName}`));
+    if (suffixMatches.length === 1) {
+      getLog().info(
+        { requested: workflowName, matched: suffixMatches[0].name },
+        'workflow_run_suffix_match'
+      );
+      workflow = suffixMatches[0];
+    } else if (suffixMatches.length > 1) {
+      const candidates = suffixMatches.map(w => `  - ${w.name}`).join('\n');
+      throw new Error(`Ambiguous workflow '${workflowName}'. Did you mean:\n${candidates}`);
+    }
+  }
+
+  // 4. Substring match (e.g., "smart" matches "archon-smart-pr-review")
+  if (!workflow) {
+    const lowerName = workflowName.toLowerCase();
+    const subMatches = workflows.filter(w => w.name.toLowerCase().includes(lowerName));
+    if (subMatches.length === 1) {
+      getLog().info(
+        { requested: workflowName, matched: subMatches[0].name },
+        'workflow_run_substring_match'
+      );
+      workflow = subMatches[0];
+    } else if (subMatches.length > 1) {
+      const candidates = subMatches.map(w => `  - ${w.name}`).join('\n');
+      throw new Error(`Ambiguous workflow '${workflowName}'. Did you mean:\n${candidates}`);
     }
   }
 
@@ -237,7 +285,7 @@ export async function workflowRunCommand(
   } catch (error) {
     const err = error as Error;
     codebaseLookupError = err;
-    getLog().warn({ err, cwd }, 'codebase_lookup_failed');
+    getLog().warn({ err, cwd }, 'cli.codebase_lookup_failed');
     if (
       err.message.includes('connect') ||
       err.message.includes('ECONNREFUSED') ||
@@ -245,8 +293,23 @@ export async function workflowRunCommand(
     ) {
       getLog().warn(
         { hint: 'Check DATABASE_URL and that the database is running.' },
-        'db_connection_hint'
+        'cli.db_connection_hint'
       );
+    }
+  }
+
+  // If the caller supplied a codebase ID (e.g., from a stored run record on resume),
+  // use it directly to avoid path-based lookup that fails for worktree paths.
+  if (!codebase && !codebaseLookupError && options.codebaseId) {
+    try {
+      codebase = await codebaseDb.getCodebase(options.codebaseId);
+    } catch (error) {
+      const err = error as Error;
+      getLog().warn(
+        { err, errorType: err.constructor.name, codebaseId: options.codebaseId },
+        'cli.codebase_id_lookup_failed'
+      );
+      // Intentional: don't set codebaseLookupError — fall through to auto-registration
     }
   }
 
@@ -258,13 +321,13 @@ export async function workflowRunCommand(
         const result = await registerRepository(repoRoot);
         codebase = await codebaseDb.getCodebase(result.codebaseId);
         if (!result.alreadyExisted) {
-          getLog().info({ name: result.name }, 'codebase_auto_registered');
+          getLog().info({ name: result.name }, 'cli.codebase_auto_registered');
         }
       } catch (error) {
         const err = error as Error;
         getLog().warn(
           { err, errorType: err.constructor.name, repoRoot },
-          'codebase_auto_registration_failed'
+          'cli.codebase_auto_registration_failed'
         );
       }
     }
@@ -274,10 +337,9 @@ export async function workflowRunCommand(
   let workingCwd = cwd;
   let isolationEnvId: string | undefined;
 
-  // Handle --resume: find the most recent failed run and reuse its worktree
-  let preCreatedRun: Awaited<ReturnType<typeof workflowDb.resumeWorkflowRun>> | undefined;
-  let startFromStep: number | undefined;
-
+  // Handle --resume: find the most recent failed run and reuse its worktree.
+  // The executor's implicit findResumableRun will detect the failed run and
+  // skip already-completed nodes automatically.
   if (options.resume) {
     if (!codebase) {
       if (codebaseLookupError) {
@@ -293,41 +355,31 @@ export async function workflowRunCommand(
       );
     }
 
-    const db = getDatabase();
-    const lastFailed = await workflowDb.findLastFailedRun(db, workflowName, codebase.id);
+    const resumable = await workflowDb.findResumableRun(workflowName, cwd);
 
-    if (!lastFailed) {
-      throw new Error(`No failed run found for workflow '${workflowName}' to resume.`);
+    if (!resumable) {
+      throw new Error(`No resumable run found for workflow '${workflowName}' at path '${cwd}'.`);
     }
 
     getLog().info(
       {
-        workflowRunId: lastFailed.id,
+        workflowRunId: resumable.id,
         workflowName,
-        currentStepIndex: lastFailed.current_step_index,
-        workingPath: lastFailed.working_path,
+        workingPath: resumable.working_path,
       },
-      'workflow.resume_found_last_failed'
+      'workflow.resume_found_resumable'
     );
 
-    // Guard: nothing to resume if the workflow failed before completing any steps
-    if (lastFailed.current_step_index === 0) {
-      throw new Error(
-        `Workflow '${workflowName}' failed before completing any steps — nothing to resume.\n` +
-          'Start a fresh run instead.'
-      );
-    }
-
-    // Reuse the working path from the failed run (verify it still exists)
-    if (lastFailed.working_path) {
+    // Reuse the working path from the resumable run (verify it still exists)
+    if (resumable.working_path) {
       const { existsSync } = await import('fs');
-      if (!existsSync(lastFailed.working_path)) {
+      if (!existsSync(resumable.working_path)) {
         throw new Error(
-          `Cannot resume: the working path from the failed run no longer exists: ${lastFailed.working_path}\n` +
+          `Cannot resume: the working path from the run no longer exists: ${resumable.working_path}\n` +
             'The worktree may have been cleaned up. Start a fresh run with --branch instead.'
         );
       }
-      workingCwd = lastFailed.working_path;
+      workingCwd = resumable.working_path;
     }
 
     // Look up the isolation environment that owns this working path (if any)
@@ -341,13 +393,7 @@ export async function workflowRunCommand(
       );
     }
 
-    // Reactivate the failed run so the executor treats it as pre-created (already running)
-    preCreatedRun = await workflowDb.resumeWorkflowRun(lastFailed.id);
-    startFromStep = lastFailed.current_step_index;
-
-    console.log(
-      `Resuming from step ${String(startFromStep + 1)} — skipping ${String(startFromStep)} already-completed step(s).`
-    );
+    console.log(`Resuming workflow run: ${resumable.id}`);
     console.log(`Working path: ${workingCwd}`);
     console.log('');
   }
@@ -382,6 +428,31 @@ export async function workflowRunCommand(
           `Warning: Reusing existing worktree at ${existingEnv.working_path}. ` +
             `--from ${options.fromBranch} was not applied (worktree already exists).`
         );
+      }
+      // Validate base branch before reuse (warning-only — non-blocking)
+      try {
+        const repoConfig = await loadRepoConfig(codebase.default_cwd);
+        const rawBase = repoConfig?.worktree?.baseBranch;
+        const configuredBase = rawBase
+          ? git.toBranchName(rawBase)
+          : await git.getDefaultBranch(git.toRepoPath(codebase.default_cwd));
+        const isValidBase = await git.isAncestorOf(
+          git.toWorktreePath(existingEnv.working_path),
+          `origin/${configuredBase}`
+        );
+        if (!isValidBase) {
+          getLog().warn(
+            { path: existingEnv.working_path, configuredBase, branch: existingEnv.branch_name },
+            'worktree.reuse_base_branch_mismatch'
+          );
+          console.warn(
+            `Warning: Worktree '${existingEnv.branch_name}' is not based on '${configuredBase}'. ` +
+              `Recreate with: bun run cli complete ${existingEnv.branch_name} --force`
+          );
+        }
+      } catch (e) {
+        getLog().debug({ err: e }, 'worktree.reuse_base_branch_check_skipped');
+        // Non-blocking — skip warning if base branch cannot be determined
       }
       getLog().info({ path: existingEnv.working_path }, 'worktree_reused');
       workingCwd = existingEnv.working_path;
@@ -472,20 +543,36 @@ export async function workflowRunCommand(
   );
 
   // Register cleanup handlers for graceful termination
-  const cleanup = async (signal: string): Promise<void> => {
+  let terminating = false;
+  const cleanup = (signal: string): void => {
+    if (terminating) return;
+    terminating = true;
     getLog().info({ conversationId: conversation.id, signal }, 'workflow.process_terminating');
-    try {
-      const activeRun = await workflowDb.getActiveWorkflowRun(conversation.id);
-      if (activeRun) {
-        await workflowDb.failWorkflowRun(activeRun.id, `Process terminated (${signal})`);
-      }
-    } catch (err) {
-      getLog().error({ err: err as Error }, 'workflow.termination_cleanup_failed');
-    }
-    process.exit(1);
+    workflowDb
+      .getActiveWorkflowRun(conversation.id)
+      .then(activeRun => {
+        if (activeRun) {
+          return workflowDb.failWorkflowRun(activeRun.id, `Process terminated (${signal})`);
+        }
+        return undefined;
+      })
+      .catch((err: unknown) => {
+        const e = err as Error;
+        getLog().error(
+          { err: e, errorType: e.constructor.name },
+          'workflow.termination_cleanup_failed'
+        );
+      })
+      .finally(() => {
+        process.exit(1);
+      });
   };
-  process.on('SIGTERM', () => void cleanup('SIGTERM'));
-  process.on('SIGINT', () => void cleanup('SIGINT'));
+  process.once('SIGTERM', () => {
+    cleanup('SIGTERM');
+  });
+  process.once('SIGINT', () => {
+    cleanup('SIGINT');
+  });
 
   // Execute workflow with workingCwd (may be worktree path)
   const result = await executeWorkflow(
@@ -496,16 +583,13 @@ export async function workflowRunCommand(
     workflow,
     userMessage,
     conversation.id,
-    codebase?.id,
-    undefined, // issueContext
-    undefined, // isolationContext
-    undefined, // parentConversationId
-    preCreatedRun, // pre-activated run for --resume
-    startFromStep // step index to resume from
+    codebase?.id
   );
 
   // Check result and exit appropriately
-  if (result.success) {
+  if (result.success && 'paused' in result && result.paused) {
+    console.log('\nWorkflow paused — waiting for approval.');
+  } else if (result.success) {
     console.log('\nWorkflow completed successfully.');
   } else {
     throw new Error(`Workflow failed: ${result.error}`);
@@ -513,10 +597,465 @@ export async function workflowRunCommand(
 }
 
 /**
- * Show workflow status (placeholder for future implementation)
+ * Format age of a run from started_at to now.
  */
-export async function workflowStatusCommand(): Promise<void> {
-  throw new Error(
-    'Workflow status not yet implemented.\nThis will show running workflows and their progress.'
-  );
+function formatAge(startedAt: Date | string): string {
+  // SQLite returns UTC strings without Z suffix — append it so Date parses as UTC
+  const date =
+    startedAt instanceof Date
+      ? startedAt
+      : new Date(startedAt.endsWith('Z') ? startedAt : startedAt + 'Z');
+  if (Number.isNaN(date.getTime())) return 'unknown';
+  const ms = Date.now() - date.getTime();
+  const secs = Math.floor(ms / 1000);
+  if (secs < 60) return `${String(secs)}s`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${String(mins)}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${String(hours)}h ${String(mins % 60)}m`;
+  const days = Math.floor(hours / 24);
+  return `${String(days)}d ${String(hours % 24)}h`;
+}
+
+/**
+ * Format a duration in milliseconds as a compact string.
+ */
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${String(ms)}ms`;
+  const secs = Math.round(ms / 100) / 10;
+  if (secs < 60) return `${String(secs)}s`;
+  const mins = Math.floor(secs / 60);
+  const remSecs = Math.round(secs % 60);
+  return `${String(mins)}m${String(remSecs)}s`;
+}
+
+interface NodeSummary {
+  nodeId: string;
+  state: 'running' | 'completed' | 'failed' | 'skipped';
+  durationMs?: number;
+  outputPreview?: string;
+  error?: string;
+}
+
+/**
+ * Derive per-node summaries from a run's workflow events.
+ * Processes node_started / node_completed / node_failed / node_skipped* events.
+ */
+function buildNodeSummaries(events: WorkflowEventRow[]): NodeSummary[] {
+  const startTimes = new Map<string, number>();
+  const summaries = new Map<string, NodeSummary>();
+
+  for (const event of events) {
+    const nodeId = event.step_name;
+    if (!nodeId) continue;
+
+    switch (event.event_type) {
+      case 'node_started': {
+        startTimes.set(nodeId, new Date(event.created_at).getTime());
+        if (!summaries.has(nodeId)) {
+          summaries.set(nodeId, { nodeId, state: 'running' });
+        }
+        break;
+      }
+      case 'node_completed': {
+        const started = startTimes.get(nodeId);
+        const endTime = new Date(event.created_at).getTime();
+        const rawOutput = event.data.node_output;
+        const output = typeof rawOutput === 'string' ? rawOutput : undefined;
+        summaries.set(nodeId, {
+          nodeId,
+          state: 'completed',
+          durationMs: started !== undefined ? endTime - started : undefined,
+          outputPreview:
+            output !== undefined
+              ? output.slice(0, 200) + (output.length > 200 ? '...' : '')
+              : undefined,
+        });
+        break;
+      }
+      case 'node_failed': {
+        const started = startTimes.get(nodeId);
+        const endTime = new Date(event.created_at).getTime();
+        summaries.set(nodeId, {
+          nodeId,
+          state: 'failed',
+          durationMs: started !== undefined ? endTime - started : undefined,
+          error: typeof event.data.error === 'string' ? event.data.error : 'Unknown error',
+        });
+        break;
+      }
+      case 'node_skipped':
+      case 'node_skipped_prior_success': {
+        summaries.set(nodeId, { nodeId, state: 'skipped' });
+        break;
+      }
+    }
+  }
+
+  return [...summaries.values()];
+}
+
+/**
+ * Look up a workflow run by ID, throwing with structured logging on failure.
+ */
+async function getRunOrThrow(runId: string, logEvent: string): Promise<WorkflowRun> {
+  let run: WorkflowRun | null;
+  try {
+    run = await workflowDb.getWorkflowRun(runId);
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, runId }, logEvent);
+    throw new Error(`Failed to look up workflow run ${runId}: ${err.message}`);
+  }
+  if (!run) {
+    throw new Error(`Workflow run not found: ${runId}`);
+  }
+  return run;
+}
+
+/**
+ * Show status of all running workflow runs.
+ */
+export async function workflowStatusCommand(json?: boolean, verbose?: boolean): Promise<void> {
+  let runs: WorkflowRun[];
+  try {
+    runs = await workflowDb.listWorkflowRuns({
+      status: ['running', 'paused'],
+    });
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err }, 'cli.workflow_status_failed');
+    throw new Error(`Failed to list workflow runs: ${err.message}`);
+  }
+
+  if (json) {
+    if (verbose) {
+      const eventsPerRun = await Promise.all(
+        runs.map(run =>
+          workflowEventsDb.listWorkflowEvents(run.id).catch(() => [] as WorkflowEventRow[])
+        )
+      );
+      const runsWithEvents = runs.map((run, i) => ({
+        ...run,
+        events: eventsPerRun[i],
+      }));
+      console.log(JSON.stringify({ runs: runsWithEvents }, null, 2));
+    } else {
+      console.log(JSON.stringify({ runs }, null, 2));
+    }
+    return;
+  }
+
+  if (runs.length === 0) {
+    console.log('No active workflows.');
+    return;
+  }
+
+  console.log(`\nActive workflows (${String(runs.length)}):\n`);
+  for (const run of runs) {
+    const age = formatAge(run.started_at);
+    console.log(`  ID:     ${run.id}`);
+    console.log(`  Name:   ${run.workflow_name}`);
+    console.log(`  Path:   ${run.working_path ?? '(none)'}`);
+    console.log(`  Status: ${run.status}`);
+    console.log(`  Age:    ${age}`);
+
+    if (verbose) {
+      let events: WorkflowEventRow[];
+      try {
+        events = await workflowEventsDb.listWorkflowEvents(run.id);
+      } catch {
+        events = [];
+      }
+      const nodes = buildNodeSummaries(events);
+      if (nodes.length > 0) {
+        console.log('  Nodes:');
+        for (const node of nodes) {
+          const iconMap: Record<string, string> = {
+            completed: '✓',
+            failed: '✗',
+            skipped: '-',
+            running: '◌',
+          };
+          const icon = iconMap[node.state] ?? '◌';
+          const duration =
+            node.durationMs !== undefined ? ` (${formatDuration(node.durationMs)})` : '';
+          const stateLabel = node.state === 'running' ? ' (running)' : '';
+          console.log(`    ${icon} ${node.nodeId}${duration}${stateLabel}`);
+          if (node.outputPreview !== undefined) {
+            console.log(`        Output: ${node.outputPreview}`);
+          }
+          if (node.error !== undefined) {
+            console.log(`        Error:  ${node.error}`);
+          }
+        }
+      }
+    }
+
+    console.log('');
+  }
+}
+
+/**
+ * Resume a failed workflow run by ID.
+ *
+ * Re-executes the workflow with --resume semantics — the executor's
+ * findResumableRun picks up the prior failed run and skips completed nodes.
+ */
+export async function workflowResumeCommand(runId: string): Promise<void> {
+  const run = await getRunOrThrow(runId, 'cli.workflow_resume_lookup_failed');
+  if (!RESUMABLE_WORKFLOW_STATUSES.includes(run.status)) {
+    throw new Error(
+      `Workflow run '${runId}' is in status '${run.status}' and cannot be resumed.\n` +
+        "Only 'failed' or 'paused' runs can be resumed."
+    );
+  }
+  if (!run.working_path) {
+    throw new Error(
+      `Workflow run '${runId}' has no working path recorded.\n` +
+        'Cannot determine where to resume. The run may be too old.'
+    );
+  }
+  console.log(`Resuming workflow: ${run.workflow_name}`);
+  console.log(`Path: ${run.working_path}`);
+  console.log('');
+
+  // Re-execute via workflowRunCommand with --resume.
+  // The executor's implicit findResumableRun detects the prior failed run
+  // and skips already-completed nodes.
+  try {
+    await workflowRunCommand(run.working_path, run.workflow_name, run.user_message ?? '', {
+      resume: true,
+      codebaseId: run.codebase_id ?? undefined,
+    });
+  } catch (error) {
+    const err = error as Error;
+    getLog().error(
+      { err, runId, workflowName: run.workflow_name },
+      'cli.workflow_resume_run_failed'
+    );
+    throw new Error(`Failed to resume workflow '${run.workflow_name}': ${err.message}`);
+  }
+}
+
+/**
+ * Abandon a workflow run by ID (marks it as cancelled).
+ */
+export async function workflowAbandonCommand(runId: string): Promise<void> {
+  const run = await getRunOrThrow(runId, 'cli.workflow_abandon_lookup_failed');
+  if (TERMINAL_WORKFLOW_STATUSES.includes(run.status)) {
+    throw new Error(
+      `Workflow run '${runId}' is in status '${run.status}' and cannot be abandoned.\n` +
+        'Run is already terminal.'
+    );
+  }
+  try {
+    await workflowDb.cancelWorkflowRun(runId);
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, runId }, 'cli.workflow_abandon_failed');
+    throw new Error(`Failed to abandon workflow run ${runId}: ${err.message}`);
+  }
+  console.log(`Abandoned workflow run: ${runId}`);
+  console.log(`Workflow: ${run.workflow_name}`);
+}
+
+/**
+ * Approve a paused workflow run by ID.
+ * Writes the approval events and transitions to 'failed' for auto-resume.
+ */
+export async function workflowApproveCommand(runId: string, comment?: string): Promise<void> {
+  const run = await getRunOrThrow(runId, 'cli.workflow_approve_lookup_failed');
+  if (run.status !== 'paused') {
+    throw new Error(
+      `Workflow run '${runId}' is in status '${run.status}' and cannot be approved.\n` +
+        "Only 'paused' runs can be approved."
+    );
+  }
+  if (!run.working_path) {
+    throw new Error(
+      `Workflow run '${runId}' has no working path recorded.\n` +
+        'Cannot determine where to resume.'
+    );
+  }
+  const approval = run.metadata.approval as ApprovalContext | undefined;
+  if (!approval?.nodeId) {
+    throw new Error('Workflow run is paused but missing approval context.');
+  }
+  const approvalComment = comment ?? 'Approved';
+  const store = createWorkflowStore();
+  // For interactive loops, do NOT write node_completed — the executor writes it when the
+  // AI emits the completion signal (actual loop exit). Writing it here would cause the
+  // resume to skip the loop node entirely via priorCompletedNodes.
+  if (approval.type !== 'interactive_loop') {
+    const nodeOutput = approval.captureResponse === true ? approvalComment : '';
+    await store.createWorkflowEvent({
+      workflow_run_id: runId,
+      event_type: 'node_completed',
+      step_name: approval.nodeId,
+      data: { node_output: nodeOutput, approval_decision: 'approved' },
+    });
+  }
+  await store.createWorkflowEvent({
+    workflow_run_id: runId,
+    event_type: 'approval_received',
+    step_name: approval.nodeId,
+    data: { decision: 'approved', comment: approvalComment },
+  });
+  // For interactive loops, store user input in metadata so the executor can pass it to the AI.
+  // For standard approval nodes, mark as approved and clear any rejection state.
+  const metadataUpdate: Record<string, unknown> =
+    approval.type === 'interactive_loop'
+      ? { loop_user_input: approvalComment }
+      : { approval_response: 'approved', rejection_reason: '', rejection_count: 0 };
+  await workflowDb.updateWorkflowRun(runId, {
+    status: 'failed',
+    metadata: metadataUpdate,
+  });
+  console.log(`Approved workflow: ${run.workflow_name}`);
+  console.log(`Path: ${run.working_path}`);
+  console.log('');
+  console.log('Resuming workflow...');
+
+  try {
+    await workflowRunCommand(run.working_path, run.workflow_name, run.user_message ?? '', {
+      resume: true,
+      codebaseId: run.codebase_id ?? undefined,
+    });
+  } catch (error) {
+    const err = error as Error;
+    getLog().error(
+      { err, runId, workflowName: run.workflow_name },
+      'cli.workflow_approve_resume_failed'
+    );
+    throw new Error(
+      `Approved but failed to resume workflow '${run.workflow_name}': ${err.message}\n` +
+        `The approval was recorded. Run 'bun run cli workflow resume ${runId}' to retry.`
+    );
+  }
+}
+
+/**
+ * Reject a paused workflow run by ID (marks it as cancelled).
+ */
+export async function workflowRejectCommand(runId: string, reason?: string): Promise<void> {
+  const run = await getRunOrThrow(runId, 'cli.workflow_reject_lookup_failed');
+  if (run.status !== 'paused') {
+    throw new Error(
+      `Workflow run '${runId}' is in status '${run.status}' and cannot be rejected.\n` +
+        "Only 'paused' runs can be rejected."
+    );
+  }
+  const approval = run.metadata.approval as ApprovalContext | undefined;
+  const store = createWorkflowStore();
+  const rejectReason = reason ?? 'Rejected';
+  await store.createWorkflowEvent({
+    workflow_run_id: runId,
+    event_type: 'approval_received',
+    step_name: approval?.nodeId ?? 'unknown',
+    data: { decision: 'rejected', reason: rejectReason },
+  });
+
+  const hasOnReject = approval?.onRejectPrompt !== undefined;
+  if (hasOnReject) {
+    const currentCount = (run.metadata.rejection_count as number | undefined) ?? 0;
+    const maxAttempts = approval?.onRejectMaxAttempts ?? 3;
+    if (currentCount + 1 >= maxAttempts) {
+      try {
+        await workflowDb.cancelWorkflowRun(runId);
+      } catch (error) {
+        const err = error as Error;
+        getLog().error({ err, runId }, 'cli.workflow_reject_failed');
+        throw new Error(`Failed to cancel workflow run ${runId}: ${err.message}`);
+      }
+      console.log(`Rejected and cancelled (max attempts reached): ${run.workflow_name}`);
+    } else {
+      try {
+        await workflowDb.updateWorkflowRun(runId, {
+          status: 'failed',
+          metadata: { rejection_reason: rejectReason, rejection_count: currentCount + 1 },
+        });
+      } catch (error) {
+        const err = error as Error;
+        getLog().error({ err, runId }, 'cli.workflow_reject_failed');
+        throw new Error(`Failed to record rejection for workflow run ${runId}: ${err.message}`);
+      }
+      console.log(`Rejected workflow: ${run.workflow_name}`);
+      if (!run.working_path) {
+        throw new Error(
+          `Workflow run '${runId}' has no working path recorded.\n` +
+            'Cannot determine where to resume.'
+        );
+      }
+      console.log('Resuming with on_reject prompt...');
+      try {
+        await workflowRunCommand(run.working_path, run.workflow_name, run.user_message ?? '', {
+          resume: true,
+          codebaseId: run.codebase_id ?? undefined,
+        });
+      } catch (error) {
+        const err = error as Error;
+        getLog().error(
+          { err, runId, workflowName: run.workflow_name },
+          'cli.workflow_reject_resume_failed'
+        );
+        throw new Error(
+          `Rejected but failed to resume workflow '${run.workflow_name}': ${err.message}\n` +
+            `The rejection was recorded. Run 'bun run cli workflow resume ${runId}' to retry.`
+        );
+      }
+    }
+  } else {
+    try {
+      await workflowDb.cancelWorkflowRun(runId);
+    } catch (error) {
+      const err = error as Error;
+      getLog().error({ err, runId }, 'cli.workflow_reject_failed');
+      throw new Error(`Failed to reject workflow run ${runId}: ${err.message}`);
+    }
+    console.log(`Rejected workflow run: ${runId}`);
+    console.log(`Workflow: ${run.workflow_name}`);
+  }
+}
+
+/**
+ * Delete terminal workflow runs older than the given number of days.
+ */
+export async function workflowCleanupCommand(days: number): Promise<void> {
+  try {
+    const { count } = await workflowDb.deleteOldWorkflowRuns(days);
+    if (count === 0) {
+      console.log(`No workflow runs older than ${String(days)} days to clean up.`);
+    } else {
+      console.log(`Deleted ${String(count)} workflow run(s) older than ${String(days)} days.`);
+    }
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, days }, 'cli.workflow_cleanup_failed');
+    throw new Error(`Failed to clean up workflow runs: ${err.message}`);
+  }
+}
+
+/**
+ * Emit a workflow event directly to the database.
+ * Non-throwing: mirrors the fire-and-forget contract of createWorkflowEvent.
+ */
+export function isValidEventType(value: string): value is WorkflowEventType {
+  return (WORKFLOW_EVENT_TYPES as readonly string[]).includes(value);
+}
+
+export async function workflowEventEmitCommand(
+  runId: string,
+  eventType: WorkflowEventType,
+  data?: Record<string, unknown>
+): Promise<void> {
+  const store = createWorkflowStore();
+  await store.createWorkflowEvent({
+    workflow_run_id: runId,
+    event_type: eventType,
+    data,
+  });
+  // createWorkflowEvent is non-throwing (fire-and-forget) — the event may not
+  // have been persisted if the DB was unavailable. Check server logs if missing.
+  console.log(`Event submitted (best-effort): ${eventType} for run ${runId}`);
 }

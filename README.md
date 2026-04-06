@@ -1,10 +1,38 @@
 # Archon
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/coleam00/Archon/actions/workflows/test.yml/badge.svg)](https://github.com/coleam00/Archon/actions/workflows/test.yml)
+[![Docs](https://img.shields.io/badge/docs-archon.diy-blue)](https://archon.diy)
+
 Make AI coding deterministic and repeatable.
 
 Archon is a workflow engine for AI coding agents. Define your development processes as YAML workflows — planning, implementation, validation, code review, PR creation — and run them reliably across all your projects.
 
 Think n8n, but for software development.
+
+## Install
+
+**macOS / Linux**
+```bash
+curl -fsSL https://archon.diy/install | bash
+```
+
+**Windows (PowerShell)**
+```powershell
+irm https://archon.diy/install.ps1 | iex
+```
+
+**Homebrew**
+```bash
+brew install coleam00/archon/archon
+```
+
+**Docker**
+```bash
+docker run --rm -v "$PWD:/workspace" ghcr.io/coleam00/archon:latest workflow list
+```
+
+See the [Installation Guide](https://archon.diy/getting-started/installation/) for all options.
 
 ## Why Archon?
 
@@ -25,18 +53,32 @@ Archon fixes this. Encode your development process as a workflow. The workflow d
 name: archon-idea-to-pr
 description: Take a feature idea from plan to merged PR
 
-steps:
-  - command: create-plan
-  - command: implement-tasks
-    clearContext: true
-  - command: validate
-  - command: create-pr
-    clearContext: true
-  - parallel:
-      - command: review-security
-      - command: review-tests
-      - command: review-types
-  - command: self-fix
+nodes:
+  - id: plan
+    command: create-plan
+  - id: implement
+    command: implement-tasks
+    context: fresh
+    depends_on: [plan]
+  - id: validate
+    command: validate
+    depends_on: [implement]
+  - id: create-pr
+    command: create-pr
+    context: fresh
+    depends_on: [validate]
+  - id: review-security
+    command: review-security
+    depends_on: [create-pr]
+  - id: review-tests
+    command: review-tests
+    depends_on: [create-pr]
+  - id: review-types
+    command: review-types
+    depends_on: [create-pr]
+  - id: self-fix
+    command: self-fix
+    depends_on: [review-security, review-tests, review-types]
 ```
 
 ```bash
@@ -85,77 +127,63 @@ curl -fsSL https://claude.ai/install.sh | bash
 irm https://claude.ai/install.ps1 | iex
 ```
 
-</details>
+**agent-browser** *(optional)* — [vercel-labs/agent-browser](https://github.com/vercel-labs/agent-browser)
 
-### AI-Assisted Setup (recommended, 2 min)
+Only needed for E2E/UI testing workflows (`archon-validate-pr`). Core functionality works without it.
 
 ```bash
-git clone https://github.com/dynamous-community/remote-coding-agent
-cd remote-coding-agent
+npm install -g agent-browser
+agent-browser install
+```
+
+See the [E2E Testing Guide](docs/e2e-testing.md) for platform-specific setup.
+
+</details>
+
+### Setup (2 min)
+
+```bash
+git clone https://github.com/coleam00/Archon
+cd Archon
 bun install
 claude
 ```
 
 Then say: **"Set up Archon"**
 
-The setup skill walks you through everything: CLI installation, authentication, platform selection, and copies the Archon skill to your target repo. When done, open Claude Code in your project and start using it.
+The setup wizard walks you through everything: CLI installation, authentication, platform selection, and copies the Archon skill to your target repo.
 
-### Manual CLI Setup (5 min)
+### Start Using Archon
 
-<details>
-<summary>Expand for manual steps</summary>
-
-**Prerequisites:** [Git](https://git-scm.com/), [Bun](https://bun.sh), [Claude Code CLI](https://docs.claude.com/en/docs/claude-code/installation)
+Once setup is complete:
 
 ```bash
-# Clone and install
-git clone https://github.com/dynamous-community/remote-coding-agent
-cd remote-coding-agent
-bun install
+# 1. Exit Claude Code in the Archon repo (Ctrl+C or /exit)
 
-# Install CLI globally
-cd packages/cli && bun link && cd ../..
-
-# Authenticate with Claude
-claude /login
-
-# Go to any git repo and run
+# 2. Go to your project
 cd /path/to/your/project
-archon workflow list
-archon workflow run archon-assist "What does this codebase do?"
+
+# 3. Open Claude Code from your project
+claude
 ```
 
-See the [CLI User Guide](docs/cli-user-guide.md) for full documentation.
-
-</details>
-
-## Using Archon on Your Project
-
-Once installed, there are two ways to use Archon on your codebases:
-
-**Option A: From the Archon repo** — Open Claude Code in the Archon repo and tell it what to do. The skill can target any project on your machine:
+Then start working:
 
 ```
-Use archon to fix issue #42 on /path/to/my-project
-```
-
-**Option B: From your own repo (recommended)** — Copy the Archon skill so you can use it directly:
-
-```bash
-cp -r <archon-repo>/.claude/skills/archon /path/to/your-repo/.claude/skills/archon
-```
-
-Then open Claude Code in your project and start working:
-
-```
-Use archon to implement a dark mode feature
+Use archon to fix issue #42
 ```
 
 ```
 What archon workflows do I have? When would I use each one?
 ```
 
-The coding agent handles workflow selection, branch naming, and worktree isolation for you. Projects are registered automatically the first time they're used — no manual setup needed.
+The coding agent handles workflow selection, branch naming, and worktree isolation for you. Projects are registered automatically the first time they're used.
+
+> **Important:** Always run Claude Code from your target repo, not from the Archon repo. The setup wizard copies the Archon skill into your project so it works from there.
+
+### Alternative setup paths
+
+- **[Getting Started](docs/getting-started.md)** — Full setup guide (Web UI or CLI)
 
 ## Web UI
 
@@ -166,7 +194,7 @@ Register a project by clicking **+** next to "Project" in the chat sidebar — e
 **Key pages:**
 - **Chat** — Conversation interface with real-time streaming and tool call visualization
 - **Dashboard** — Mission Control for monitoring running workflows, with filterable history by project, status, and date
-- **Workflow Builder** — Visual drag-and-drop editor for creating DAG, sequential, and loop workflows
+- **Workflow Builder** — Visual drag-and-drop editor for creating DAG workflows with loop nodes
 - **Workflow Execution** — Step-by-step progress view for any running or completed workflow
 
 **Monitoring hub:** The sidebar shows conversations from **all platforms** — not just the web. Workflows kicked off from the CLI, messages from Slack or Telegram, GitHub issue interactions — everything appears in one place.
@@ -179,17 +207,27 @@ Archon ships with workflows for common development tasks:
 
 | Workflow | What it does |
 |----------|-------------|
-| `archon-idea-to-pr` | Feature description → plan → implement → validate → PR → 5 parallel review agents → self-fix |
-| `archon-fix-github-issue` | Fetch issue → classify (bug/feature) → investigate → implement → validate → PR → close issue |
-| `archon-smart-pr-review` | Classify PR complexity → run targeted review agents → synthesize → post structured comment |
-| `archon-ralph-fresh` | Read PRD with multiple stories → implement one by one → fresh context each iteration → loop until done |
-| `archon-ralph-stateful` | Same as above but preserves context across iterations for interdependent stories |
+| `archon-assist` | General Q&A, debugging, exploration — full Claude Code agent with all tools |
+| `archon-fix-github-issue` | Classify issue → investigate/plan → implement → validate → PR → smart review → self-fix |
+| `archon-idea-to-pr` | Feature idea → plan → implement → validate → PR → 5 parallel reviews → self-fix |
+| `archon-plan-to-pr` | Execute existing plan → implement → validate → PR → review → self-fix |
+| `archon-issue-review-full` | Comprehensive fix + full multi-agent review pipeline for GitHub issues |
+| `archon-smart-pr-review` | Classify PR complexity → run targeted review agents → synthesize findings |
+| `archon-comprehensive-pr-review` | Multi-agent PR review (5 parallel reviewers) with automatic fixes |
+| `archon-create-issue` | Classify problem → gather context → investigate → create GitHub issue |
+| `archon-validate-pr` | Thorough PR validation testing both main and feature branches |
 | `archon-resolve-conflicts` | Detect merge conflicts → analyze both sides → resolve → validate → commit |
-| `archon-assist` | Simple Q&A — no workflow overhead, just talk to the AI about your code |
+| `archon-feature-development` | Implement feature from plan → validate → create PR |
+| `archon-architect` | Architectural sweep, complexity reduction, codebase health improvement |
+| `archon-refactor-safely` | Safe refactoring with type-check hooks and behavior verification |
+| `archon-ralph-dag` | PRD implementation loop — iterate through stories until done |
+| `archon-remotion-generate` | Generate or modify Remotion video compositions with AI |
+| `archon-test-loop-dag` | Loop node test workflow — iterative counter until completion |
+| `archon-piv-loop` | Guided Plan-Implement-Validate loop with human review between iterations |
 
-Archon ships 16 workflows total — run `archon workflow list` or ask your agent to see them all.
+Archon ships 17 default workflows — run `archon workflow list` or describe what you want and the router picks the right one.
 
-**Or define your own.** Workflows are YAML files in `.archon/workflows/`. Commands are markdown files in `.archon/commands/`. Commit them to your repo — your whole team runs the same process.
+**Or define your own.** Default workflows are great starting points — copy one from `.archon/workflows/defaults/` and customize it. Workflows are YAML files in `.archon/workflows/`, commands are markdown files in `.archon/commands/`. Same-named files in your repo override the bundled defaults. Commit them — your whole team runs the same process.
 
 See [Authoring Workflows](docs/authoring-workflows.md) and [Authoring Commands](docs/authoring-commands.md).
 
@@ -239,9 +277,11 @@ The Web UI and CLI work out of the box. Optionally connect a chat platform for r
 
 ## Documentation
 
+Full documentation is available at **[archon.diy](https://archon.diy)**.
+
 | Topic | Description |
 |-------|-------------|
-| [Getting Started](docs/getting-started.md) | CLI-focused setup guide |
+| [Getting Started](docs/getting-started.md) | Setup guide (Web UI or CLI) |
 | [CLI User Guide](docs/cli-user-guide.md) | Full CLI reference |
 | [Authoring Workflows](docs/authoring-workflows.md) | Create custom YAML workflows |
 | [Authoring Commands](docs/authoring-commands.md) | Create reusable AI commands |
@@ -252,12 +292,15 @@ The Web UI and CLI work out of the box. Optionally connect a chat platform for r
 | [Commands Reference](docs/commands-reference.md) | All slash commands |
 | [Architecture](docs/architecture.md) | System design and internals |
 | [Troubleshooting](docs/troubleshooting.md) | Common issues and fixes |
+| [E2E Testing](docs/e2e-testing.md) | agent-browser setup for E2E workflows |
 | [Windows Setup](docs/windows.md) | Windows and WSL2 guide |
 
 ## Contributing
 
-Contributions welcome. See the open [issues](https://github.com/dynamous-community/remote-coding-agent/issues) for things to work on.
+Contributions welcome! See the open [issues](https://github.com/coleam00/Archon/issues) for things to work on.
+
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a pull request.
 
 ## License
 
-MIT
+[MIT](LICENSE)
